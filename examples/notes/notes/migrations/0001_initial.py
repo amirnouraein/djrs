@@ -29,6 +29,8 @@ class Migration(migrations.Migration):
                 ("pinned", models.BooleanField(default=False)),
                 ("priority", models.IntegerField(default=0)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+                ("color", models.CharField(blank=True, max_length=20, null=True)),
                 (
                     "owner",
                     models.ForeignKey(

@@ -95,7 +95,7 @@ class GenerateTests(unittest.TestCase):
         self.assertIn("Pattern::opaque(", routes)
         self.assertIn('"x":1', routes)
         cov = json.loads(files["djrs-coverage.json"])
-        self.assertEqual(cov["summary"], {"views": 2, "rust": 0, "django": 2})
+        self.assertEqual(cov["summary"], {"views": 2, "rust": 0, "django": 2, "translated": 0})
         self.assertTrue(cov["opaque_patterns"])
         self.assertEqual(cov["views"]["demo.views.b"]["reasons"], ["Django class-based views are not supported yet"])
 
@@ -137,7 +137,7 @@ class HandlerConfigTests(unittest.TestCase):
         data = _ir()
         data["views"]["demo.views.a"] = self._drf_view()
         config = {"shims": {"demo_shims": "rust/demo.rs"}, "drf_handlers": {"demo.views.a": {"GET": "demo_shims::a"}}}
-        body, decls, status = handlers.build(data, config, "/proj", "/proj/gateway/src", [])
+        body, decls, status, _ = handlers.build(data, config, "/proj", "/proj/gateway/src", [])
         self.assertEqual(status, {"demo.views.a": []})
         self.assertIn("Authenticator::Token", body)
         self.assertIn('(r#"GET"#, crate::demo_shims::a)', body)
@@ -149,7 +149,7 @@ class HandlerConfigTests(unittest.TestCase):
         data = _ir()
         data["views"]["demo.views.a"] = self._drf_view(throttle_classes=["x.Throttle"], permission_classes=["x.Custom"])
         config = {"drf_handlers": {"demo.views.a": {"GET": "m::a"}}}
-        _, _, status = handlers.build(data, config, "/p", "/p/g/src", ["middleware x is not supported"])
+        _, _, status, _ = handlers.build(data, config, "/p", "/p/g/src", ["middleware x is not supported"])
         self.assertIn("middleware x is not supported", status["demo.views.a"])
         self.assertIn("throttling is not supported yet", status["demo.views.a"])
         self.assertIn("permission class x.Custom is not supported", status["demo.views.a"])

@@ -13,3 +13,9 @@ class NoteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Note
         fields = ["id", "title", "body", "pinned", "priority", "created_at"]
+
+
+class NoteDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Note
+        fields = ["id", "title", "color", "pinned", "priority", "owner", "updated_at"]

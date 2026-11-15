@@ -109,6 +109,21 @@ impl From<i32> for Py {
         Py::Int(i as i64)
     }
 }
+impl From<i16> for Py {
+    fn from(i: i16) -> Py {
+        Py::Int(i as i64)
+    }
+}
+impl From<u16> for Py {
+    fn from(i: u16) -> Py {
+        Py::Int(i as i64)
+    }
+}
+impl From<u32> for Py {
+    fn from(i: u32) -> Py {
+        Py::Int(i as i64)
+    }
+}
 impl From<f64> for Py {
     fn from(f: f64) -> Py {
         Py::Float(f)

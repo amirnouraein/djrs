@@ -458,6 +458,8 @@ class Extractor:
             "max_value",
             "min_value",
             "pk_field",
+            "binary",
+            "uuid_format",
         ):
             if hasattr(field, attr):
                 entry[attr] = to_json(getattr(field, attr))

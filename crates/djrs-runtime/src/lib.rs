@@ -10,6 +10,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod drf;
+pub mod ops;
 pub mod orm;
 pub mod proxy;
 pub mod py;

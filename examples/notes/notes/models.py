@@ -16,6 +16,8 @@ class Note(models.Model):
     pinned = models.BooleanField(default=False)
     priority = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    color = models.CharField(max_length=20, null=True, blank=True)
     tags = models.ManyToManyField(Tag, blank=True, related_name="notes")
 
     class Meta:

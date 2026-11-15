@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 
 from djrs import __version__, ir
+from djrs import translate as translator
 
 from . import entities, handlers, pyregex, settings_rs
 from .eligibility import project_blockers, view_blockers
@@ -124,28 +125,30 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None, config=None
     blockers = project_blockers(data)
     settings_src, settings_problems = settings_rs.build(data)
     blockers = blockers + settings_problems
-    handlers_body, shim_decls, handled = handlers.build(
-        data, config, config_dir or os.getcwd(), os.path.join(final_dir, "src"), blockers
+    translation = translator.translate(data)
+    handlers_body, shim_decls, handled, origin = handlers.build(
+        data, config, config_dir or os.getcwd(), os.path.join(final_dir, "src"), blockers, translation.handlers
     )
     urls_by_view = _url_index(data["urls"])
     views = {}
     for view_id, view in sorted(data["views"].items()):
+        is_translated = view_id in translation.handlers
         if handled.get(view_id) == []:
-            status, reasons = "rust", ["hand-written handler (djrs.toml)"]
+            status = "rust"
+            reasons = ["hand-written handler (djrs.toml)" if origin[view_id] == "djrs.toml" else "translated"]
         else:
-            # Project-wide blockers are reported once, not on every view.
-            reasons = handled.get(view_id) or view_blockers(view, data)
-            reasons = [r for r in reasons if r not in blockers]
-            # Translation arrives in a later milestone; until then every view
-            # without a hand-written handler is forwarded, with that reason.
-            if not reasons:
-                reasons = ["translator: not implemented yet"]
             status = "django"
+            reasons = handled.get(view_id) or view_blockers(view, data) or translation.reasons.get(view_id) or []
+            # Project-wide blockers are reported once, not on every view.
+            reasons = [r for r in reasons if r not in blockers]
+            if not reasons:
+                reasons = ["translated, but held back by the project-wide blockers"]
         views[view_id] = {
             "kind": view.get("kind"),
             "methods": view.get("methods"),
             "urls": urls_by_view.get(view_id, []),
             "status": status,
+            "translated": is_translated,
             "reasons": reasons,
         }
     report = Report(blockers, views)
@@ -182,7 +185,8 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None, config=None
         + "mod entities;\n"
         + "mod handlers;\n"
         + "mod routes;\n"
-        + "mod settings;\n\n"
+        + "mod settings;\n"
+        + "mod translated;\n\n"
         + ("// Hand-written Rust from djrs.toml [shims].\n" + shim_decls + "\n" if shim_decls else "")
         + "fn main() {\n"
         + "    let app = djrs_runtime::App::new(%s, routes::tree()).settings(&settings::SETTINGS);\n" % raw_str(name)
@@ -212,7 +216,12 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None, config=None
         "djrs": __version__,
         "project_blockers": blockers,
         "opaque_patterns": sorted(set(opaque_notes)),
-        "summary": {"views": len(views), "rust": report.counts()[0], "django": report.counts()[1]},
+        "summary": {
+            "views": len(views),
+            "rust": report.counts()[0],
+            "django": report.counts()[1],
+            "translated": sum(1 for v in views.values() if v["translated"]),
+        },
         "views": views,
         "models": model_report,
     }
@@ -222,6 +231,7 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None, config=None
     _write(os.path.join(out_dir, "src", "main.rs"), main_rs)
     _write(os.path.join(out_dir, "src", "routes.rs"), routes_rs)
     _write(os.path.join(out_dir, "src", "handlers.rs"), handlers_rs)
+    _write(os.path.join(out_dir, "src", "translated.rs"), header + "\n" + translation.source)
     _write(os.path.join(out_dir, "src", "entities.rs"), entities_rs)
     _write(os.path.join(out_dir, "src", "settings.rs"), header + "\n" + settings_src)
     _write(os.path.join(out_dir, "djrs-coverage.json"), ir.dumps(coverage))
@@ -233,6 +243,8 @@ def _coverage_md(cov):
     lines = ["# djrs coverage", ""]
     s = cov["summary"]
     lines.append("%d views: %d answered in Rust, %d forwarded to Django." % (s["views"], s["rust"], s["django"]))
+    lines.append("")
+    lines.append("%d views translated to Rust automatically." % s.get("translated", 0))
     lines.append("")
     if cov["project_blockers"]:
         lines.append("## Blocks every view")

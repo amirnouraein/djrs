@@ -1,28 +1,11 @@
 # djrs configuration for the sample project.
 #
-# Until the translator exists, these views are answered by hand-written Rust
-# (rust/notes_shims.rs). Every other view is forwarded to Django.
+# DRF views are translated to Rust automatically. A view the translator can't
+# handle can get a hand-written Rust handler ("shim") here; a view named here
+# uses its shim even when it also translates.
 
 [shims]
 notes_shims = "rust/notes_shims.rs"
 
-[drf_handlers."notes.views.list_notes"]
-GET = "notes_shims::list_notes"
-
-[drf_handlers."notes.views.list_pinned_notes"]
-GET = "notes_shims::list_pinned_notes"
-
-[drf_handlers."notes.views.get_note"]
-GET = "notes_shims::get_note"
-
-[drf_handlers."notes.views.create_note"]
-POST = "notes_shims::create_note"
-
-[drf_handlers."notes.views.delete_note"]
-POST = "notes_shims::delete_note"
-
-[drf_handlers."notes.views.count_notes"]
-GET = "notes_shims::count_notes"
-
-[drf_handlers."notes.views.public_ping"]
-GET = "notes_shims::public_ping"
+[drf_handlers."notes.views.priority_stats"]
+GET = "notes_shims::priority_stats"

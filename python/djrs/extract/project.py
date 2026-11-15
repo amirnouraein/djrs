@@ -210,6 +210,7 @@ def drf_messages():
         "ParseError",
         "UnsupportedMediaType",
         "NotAcceptable",
+        "ValidationError",
     ):
         cls = getattr(exceptions, name, None)
         if cls is not None:

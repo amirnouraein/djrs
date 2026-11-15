@@ -1,8 +1,9 @@
 """`src/handlers.rs`: registers Rust handlers for views.
 
-For now the handlers come from the project's `djrs.toml` (hand-written Rust,
-"shims"); the translator will produce the same shape. A view is registered
-only when its DRF configuration is something djrs-runtime reproduces exactly.
+Handlers come from the translator (`src/translated.rs`) and from the
+project's `djrs.toml` (hand-written Rust, "shims"), which wins for any view
+it names. A view is registered only when its DRF configuration is something
+djrs-runtime reproduces exactly and nothing project-wide blocks it.
 
 djrs.toml:
 
@@ -75,16 +76,21 @@ def _const_name(i):
     return "VIEW_%d" % i
 
 
-def build(data, config, config_dir, src_dir_final, blockers):
-    """Returns (handlers_rs_body, shim_mod_decls, status) where status maps
-    view id -> list of reasons it is NOT answered in Rust ([] = it is)."""
+def build(data, config, config_dir, src_dir_final, blockers, translated=None):
+    """Returns (handlers_rs_body, shim_mod_decls, status, source) where status
+    maps view id -> list of reasons it is NOT answered in Rust ([] = it is) and
+    source says where each answered view's handler comes from."""
     config = config or {}
     shims = config.get("shims") or {}
-    mapping = config.get("drf_handlers") or {}
+    mapping = {k: (v, "djrs.toml") for k, v in (config.get("drf_handlers") or {}).items()}
+    for view_id, methods in (translated or {}).items():
+        mapping.setdefault(view_id, (methods, "translated"))
     status = {}
+    source = {}
     statics = []
     registrations = []
-    for i, (view_id, methods) in enumerate(sorted(mapping.items())):
+    for i, (view_id, (methods, origin)) in enumerate(sorted(mapping.items())):
+        source[view_id] = origin
         view = data["views"].get(view_id)
         if view is None:
             status[view_id] = ["djrs.toml names a view that doesn't exist"]
@@ -135,7 +141,7 @@ def build(data, config, config_dir, src_dir_final, blockers):
         target = os.path.normpath(os.path.join(config_dir, rel))
         path = os.path.relpath(target, src_dir_final).replace(os.sep, "/")
         decls.append("#[path = %s]\nmod %s;\n" % ('"%s"' % path, mod_name))
-    return body, "".join(decls), status
+    return body, "".join(decls), status, source
 
 
 def load_config(path):

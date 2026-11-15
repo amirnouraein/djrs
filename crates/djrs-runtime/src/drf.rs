@@ -92,6 +92,56 @@ impl ApiError {
     pub fn permission_denied(s: &ProjectSettings) -> ApiError {
         ApiError::from_message(403, &s.drf.permission_denied)
     }
+
+    /// `raise <APIException subclass>(detail)` in a view: DRF's exception
+    /// handler answers a list or dict detail as it is, anything else as
+    /// `{"detail": ...}`. `detail` None means the class's default detail.
+    pub fn raised(status: u16, detail: Option<Py>, default_detail: &str) -> ApiError {
+        let data = match detail {
+            None => crate::pydict! { "detail" => default_detail },
+            Some(d) => match error_details(&d) {
+                d @ (Py::List(_) | Py::Dict(_)) => d,
+                d => crate::pydict! { "detail" => d },
+            },
+        };
+        ApiError {
+            status,
+            data,
+            www_authenticate: None,
+        }
+    }
+
+    /// `raise ValidationError(detail)`: anything but a list or dict is wrapped in a list.
+    pub fn validation(detail: Option<Py>, default_detail: &str) -> ApiError {
+        let d = match detail {
+            None => Py::List(vec![Py::from(default_detail)]),
+            Some(d @ (Py::List(_) | Py::Dict(_))) => d,
+            Some(d) => Py::List(vec![d]),
+        };
+        ApiError {
+            status: 400,
+            data: error_details(&d),
+            www_authenticate: None,
+        }
+    }
+}
+
+/// `rest_framework.exceptions._get_error_details`: containers kept, every
+/// leaf becomes `force_str(leaf)`.
+pub fn error_details(v: &Py) -> Py {
+    match v {
+        Py::List(l) => Py::List(l.iter().map(error_details).collect()),
+        Py::Dict(d) => Py::Dict(
+            d.iter()
+                .map(|(k, v)| (k.clone(), error_details(v)))
+                .collect(),
+        ),
+        Py::Str(s) => Py::Str(s.clone()),
+        other => match crate::ops::str_string(other) {
+            Ok(s) => Py::Str(s),
+            Err(_) => Py::None, // unreachable: containers handled above
+        },
+    }
 }
 
 /// Why a handler stopped early.
@@ -124,6 +174,13 @@ impl DrfResponse {
             data: Some(data),
         }
     }
+    /// `Response(data)`: DRF renders `None` as an empty body.
+    pub fn data(data: Py) -> DrfResponse {
+        DrfResponse {
+            status: 200,
+            data: if data == Py::None { None } else { Some(data) },
+        }
+    }
     pub fn with_status(mut self, status: u16) -> DrfResponse {
         self.status = status;
         self
@@ -153,6 +210,27 @@ impl Data {
     pub fn get_or(&self, key: &str, default: Py) -> Result<Py, Stop> {
         Ok(self.get(key)?.unwrap_or(default))
     }
+    /// `request.data[key]`: KeyError (a 500) when missing.
+    pub fn getitem(&self, key: &str) -> Result<Py, Stop> {
+        self.get(key)?
+            .ok_or(Stop::Forward("KeyError on request.data"))
+    }
+    /// `key in request.data`.
+    pub fn contains(&self, key: &str) -> Result<bool, Stop> {
+        match self {
+            Data::Json(Py::Dict(d)) => Ok(d.contains_key(key)),
+            Data::Json(Py::List(l)) => Ok(l.iter().any(|x| matches!(x, Py::Str(s) if s == key))),
+            Data::Json(_) => Err(Stop::Forward("'in' on request.data that isn't a container")),
+            Data::Form(q) => Ok(q.contains(key)),
+        }
+    }
+    /// `request.data` used as a value: only JSON data is a plain Python value.
+    pub fn value(&self) -> Result<Py, Stop> {
+        match self {
+            Data::Json(v) => Ok(v.clone()),
+            Data::Form(_) => Err(Stop::Forward("request.data is a QueryDict")),
+        }
+    }
 }
 
 /// Everything a handler can read, plus its transaction.
@@ -161,6 +239,8 @@ pub struct Ctx {
     pub settings: &'static ProjectSettings,
     pub method: Method,
     pub kwargs: serde_json::Map<String, serde_json::Value>,
+    /// Positional URL arguments (unnamed regex groups).
+    pub args: Vec<serde_json::Value>,
     /// `request.query_params` / `request.GET`.
     pub query: QueryDict,
     /// `request.user` when authenticated.
@@ -192,6 +272,48 @@ impl Ctx {
     /// `request.user.pk` as a query value; AnonymousUser's pk is None.
     pub fn user_pk_value(&self) -> Option<Value> {
         self.user.as_ref().map(|u| u.pk_value.clone())
+    }
+
+    /// Bind the view function's parameters (after `request`) the way Python
+    /// does from `view(request, *args, **kwargs)`. `names` are the
+    /// parameters in order, `defaults[i]` the default of `names[i]`, if any.
+    /// Anything Python would reject with TypeError is forwarded.
+    pub fn bind_params(&self, names: &[&str], defaults: &[Option<Py>]) -> Result<Vec<Py>, Stop> {
+        if self.args.len() > names.len() {
+            return Err(Stop::Forward("too many positional URL arguments"));
+        }
+        if self.kwargs.keys().any(|k| !names.contains(&k.as_str())) {
+            return Err(Stop::Forward("URL keyword argument the view doesn't take"));
+        }
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let v = if i < self.args.len() {
+                if self.kwargs.contains_key(*name) {
+                    return Err(Stop::Forward("URL argument given twice"));
+                }
+                Some(self.args[i].clone())
+            } else {
+                self.kwargs.get(*name).cloned()
+            };
+            out.push(match v {
+                Some(v) => Py::from_json(v).ok_or(Stop::Forward("URL argument out of range"))?,
+                None => match defaults.get(i).cloned().flatten() {
+                    Some(d) => d,
+                    None => return Err(Stop::Forward("missing URL argument")),
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// `request.method`.
+    pub fn method_py(&self) -> Py {
+        Py::Str(self.method.as_str().to_string())
+    }
+
+    /// `request.user.pk` (`request.user.id`): None for AnonymousUser.
+    pub fn user_pk(&self) -> Py {
+        self.user.as_ref().map(|u| u.pk.clone()).unwrap_or(Py::None)
     }
 
     /// `request.data`, parsed on first use like DRF does.
@@ -636,6 +758,7 @@ pub async fn dispatch(
                     settings,
                     method: method.clone(),
                     kwargs: m.kwargs.clone(),
+                    args: m.args.clone(),
                     query,
                     user: a.user,
                     auth: a.token,

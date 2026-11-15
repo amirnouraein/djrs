@@ -127,6 +127,10 @@ def extract_models(locator):
             "custom_save": _defining_class(model, "save"),
             "custom_delete": _defining_class(model, "delete"),
             "custom_refresh": _defining_class(model, "refresh_from_db"),
+            # `if obj:` is always true unless the model changes truthiness.
+            "custom_bool": _defining_class(model, "__bool__") or _defining_class(model, "__len__"),
+            "custom_init": _defining_class(model, "__init__"),
+            "select_on_save": bool(getattr(meta, "select_on_save", False)),
             "parents": sorted(p._meta.label for p in meta.parents),
             "fields": [_field(model, f) for f in meta.get_fields(include_hidden=True)],
         }
