@@ -17,8 +17,9 @@ particular project, and it is not tied to a Django, DRF or database version.
 | --- | --- |
 | Extractor (`djrs extract`) | Working. Tested on Django 3.0, 4.2 and 5.2 (CI adds 3.2), and on a 650-endpoint production project |
 | Rust binary: Django-order URL resolution, forwarding proxy, switches | Working |
-| Test hook (`djrs.testing`): a project's own tests run through the binary | Working |
-| Translating views to Rust handlers | Not started. Every view is forwarded for now, with the reason in `COVERAGE.md` |
+| Test hook (`djrs.testing`): a project's own tests run through the binary | Working, with a byte-for-byte comparison mode |
+| Runtime for Rust handlers: SeaORM entities, DRF request cycle, token / session / basic auth, Django's response headers | Working for DRF function views; proven with hand-written handlers on SQLite, MySQL and PostgreSQL |
+| Translating views to Rust automatically | Not started. Views without a Rust handler are forwarded, with the reason in `COVERAGE.md` |
 
 ## How it works
 
@@ -72,9 +73,47 @@ DJRS_BINARY=gateway/target/debug/mysite-gateway \
 
 No change to the project is needed. The runner serves Django in-process on a
 free port, starts the binary in front of it, and makes Django's test client
-send real HTTP to the binary. Test data is committed so the binary can see it
-(`TestCase` behaves like `TransactionTestCase`), which makes suites slower.
-Without `DJRS_BINARY` it is Django's normal runner.
+send real HTTP to the binary. Without `DJRS_BINARY` it is Django's normal runner.
+
+- If the binary answers nothing in Rust, Django's in-process server shares the
+  test's database connection, so tests behave exactly as they do in-process.
+- If it has Rust handlers, test data is committed so the binary can read it
+  (`TestCase` behaves like `TransactionTestCase`): slower, and code that relies
+  on transactions can behave differently. `DJRS_TEST_COMMIT=0|1` overrides.
+- `DJRS_COMPARE=1` also sends every GET straight to Django and reports any
+  difference in status, headers (in order) or body bytes.
+  `DJRS_COMPARE_STRICT=1` makes differences fail the run.
+
+## Rust handlers
+
+A view is answered in Rust when the generated crate has a handler for it.
+Until the translator exists, handlers are hand-written and listed in the
+project's `djrs.toml` (see `examples/notes/djrs.toml`):
+
+```toml
+[shims]
+notes_shims = "rust/notes_shims.rs"     # compiled into the generated crate
+
+[drf_handlers."notes.views.count_notes"]
+GET = "notes_shims::count_notes"
+```
+
+```bash
+python -m djrs generate djrs.json --out gateway --config djrs.toml
+```
+
+A handler gets a `Ctx` (the request, `request.user`, `request.data`, and a
+database transaction) after djrs-runtime has run DRF's cycle: content
+negotiation, authentication, permissions and the method check. It returns a
+DRF response, a DRF error, or `Stop::Forward`, which rolls the transaction
+back and hands the request to Django. The transaction commits only after the
+response has been rendered, so any failure before that leaves no trace and
+Django answers instead.
+
+A view is registered only when its DRF setup is one djrs-runtime reproduces
+(the standard authentication, permission, renderer and parser classes, no
+throttling or versioning) and the project has no middleware djrs doesn't know.
+`COVERAGE.md` says why each other view goes to Django.
 
 ## Binary settings
 
@@ -86,6 +125,9 @@ Without `DJRS_BINARY` it is Django's normal runner.
 | `DJRS_FORWARDED_HEADERS` | `preserve` | `preserve` passes `X-Forwarded-*` through untouched; `append` adds the client address |
 | `DJRS_MAX_NATIVE_BODY` | `2621440` | Larger request bodies always go to Django |
 | `DJRS_LOG` | `info` | Log filter, e.g. `djrs_runtime=debug` shows every forwarding decision |
+| `DJRS_DATABASE_ENGINE`, `_NAME`, `_USER`, `_PASSWORD`, `_HOST`, `_PORT` | none | The project's database, as in Django's `DATABASES["default"]`. Without it every request goes to Django |
+| `DJRS_DATABASE_POOL` | `16` | Connection pool size |
+| `DJRS_SECRET_KEY`, `DJRS_SECRET_KEY_FALLBACKS` | none | The project's `SECRET_KEY` (and fallbacks, comma-separated), to read sessions |
 | `DJRS_TEST_MODE` | off | Set only by `djrs.testing`; never in production |
 
 ## Repository layout

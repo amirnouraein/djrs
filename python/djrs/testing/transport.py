@@ -19,6 +19,12 @@ from .middleware import HTTPS_HEADER, NO_CSRF_HEADER, TOKEN_HEADER, USER_HEADER
 
 _original_call = None
 _base = None
+# Compare mode: GET requests are also sent straight to Django, and any
+# difference in status, headers or body is recorded.
+_compare_base = None
+mismatches = []
+compared = [0]
+IGNORED_HEADERS = {"date", "server", "connection", "keep-alive"}
 
 # Characters Django's test client leaves unescaped in PATH_INFO round trips.
 _PATH_SAFE = "/:@!$&'()*+,;=-._~"
@@ -81,6 +87,9 @@ def _response_from_http(status, reason, header_list, body):
             merged[lower] = merged[lower] + ", " + value
     for name in order:
         response[name] = merged[name.lower()]
+    location = merged.get("location")
+    if status in (301, 302, 303, 307, 308) and location is not None:
+        response.url = location  # HttpResponseRedirect.url
     content_type = merged.get("content-type", "")
     if content_type.startswith("application/json") or "+json" in content_type:
         try:
@@ -105,31 +114,72 @@ def _http_call(self, environ):
     if force_token is not None:
         headers.append((_header_name(TOKEN_HEADER[5:]), str(getattr(force_token, "key", force_token))))
 
-    parts = urlsplit(_base)
-    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=120)
-    try:
-        conn.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
-        for name, value in headers:
-            conn.putheader(name, value)
-        if body or method in ("POST", "PUT", "PATCH"):
-            conn.putheader("Content-Length", str(len(body)))
-        conn.endheaders(body if body else None)
-        resp = conn.getresponse()
-        data = resp.read()
-        response = _response_from_http(resp.status, resp.reason, resp.getheaders(), data)
-    finally:
-        conn.close()
+    status, reason, header_list, data = _send(_base, method, url, headers, body)
+    if _compare_base and method == "GET":
+        _compare(url, headers, (status, header_list, data))
+    response = _response_from_http(status, reason, header_list, data)
     response.wsgi_request = WSGIRequest(environ)
     return response
 
 
-def install_transport(base_url):
-    global _original_call, _base
+def _send(base, method, url, headers, body):
+    parts = urlsplit(base)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=120)
+    try:
+        conn.putrequest(method, url, skip_host=True, skip_accept_encoding=True)
+        for name, value in headers:
+            # WSGI strings are latin-1; tests sometimes put other characters
+            # in headers, which only UTF-8 bytes can carry over the wire.
+            try:
+                conn.putheader(name, value.encode("latin-1"))
+            except UnicodeEncodeError:
+                conn.putheader(name, value.encode("utf-8"))
+        if body or method in ("POST", "PUT", "PATCH"):
+            conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body if body else None)
+        resp = conn.getresponse()
+        return resp.status, resp.reason, resp.getheaders(), resp.read()
+    finally:
+        conn.close()
+
+
+def _comparable(header_list):
+    out = []
+    for k, v in header_list:
+        k = k.lower()
+        if k in IGNORED_HEADERS:
+            continue
+        if k == "allow":
+            # @api_view builds its method list from a set: the order differs
+            # between Django processes, so any order is Django's answer.
+            v = ", ".join(sorted(p.strip() for p in v.split(",")))
+        out.append((k, v))
+    return out
+
+
+def _compare(url, headers, got):
+    status, header_list, data = got
+    d_status, _reason, d_headers, d_data = _send(_compare_base, "GET", url, headers, b"")
+    compared[0] += 1
+    diffs = []
+    if status != d_status:
+        diffs.append("status %s vs Django %s" % (status, d_status))
+    if _comparable(header_list) != _comparable(d_headers):
+        diffs.append("headers %s vs Django %s" % (_comparable(header_list), _comparable(d_headers)))
+    if data != d_data:
+        diffs.append("body %r vs Django %r" % (data[:300], d_data[:300]))
+    if diffs:
+        mismatches.append({"url": url, "diffs": diffs})
+
+
+def install_transport(base_url, compare_base=None):
+    global _original_call, _base, _compare_base
     from django.test.client import ClientHandler
 
     if _original_call is None:
         _original_call = ClientHandler.__call__
     _base = base_url
+    _compare_base = compare_base
     ClientHandler.__call__ = _http_call
 
 

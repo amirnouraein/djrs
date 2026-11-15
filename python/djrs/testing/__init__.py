@@ -13,9 +13,15 @@ With it:
   directly. Its shortcuts (force_authenticate, CSRF checks off) travel as
   test-only headers that `djrs.testing.middleware` and the binary's test mode
   turn back into the same request state.
-* Test data is committed so the binary's own database connection can see it:
-  TestCase behaves like TransactionTestCase (setUpTestData runs per test, the
-  database is flushed between tests). SQLite test databases are put in a file.
+* When the binary answers nothing in Rust (forward-only), Django's in-process
+  server uses the test's own database connection, so TestCase transactions
+  behave exactly as they do in-process.
+* When the binary has Rust handlers, test data must be committed so its own
+  database connection can see it: TestCase then behaves like
+  TransactionTestCase (setUpTestData runs per test, the database is flushed
+  between tests), and SQLite test databases are put in a file. Code that
+  depends on transactions (on_commit, select_for_update) can behave
+  differently in this mode. DJRS_TEST_COMMIT=0/1 overrides the choice.
 
 Known differences from in-process tests: `response.context` is not available,
 and a response is a plain HttpResponse rebuilt from the bytes on the wire
@@ -60,9 +66,15 @@ def _wait_for_port(port, proc, timeout=20.0):
 
 
 class _DjangoServer:
-    """The project's WSGI app on a free port, in a background thread."""
+    """The project's WSGI app on a free port, in a background thread.
 
-    def __init__(self):
+    With `shared` connections, every request thread uses the test thread's
+    database connections (the test thread is blocked waiting for the response,
+    so they are never used at the same time). Requests then see the data of
+    the running TestCase transaction, as in-process requests do.
+    """
+
+    def __init__(self, shared=None):
         from django.core.handlers.wsgi import WSGIHandler
         from django.core.servers.basehttp import ThreadedWSGIServer, WSGIRequestHandler
 
@@ -70,9 +82,21 @@ class _DjangoServer:
             def log_message(self, *args):
                 pass
 
+        app = WSGIHandler()
+        if shared:
+            from django.db import connections
+
+            def shared_app(environ, start_response):
+                for alias, conn in shared.items():
+                    connections[alias] = conn
+                return app(environ, start_response)
+
+            handler = shared_app
+        else:
+            handler = app
         self.port = _free_port()
         self.httpd = ThreadedWSGIServer(("127.0.0.1", self.port), QuietHandler, allow_reuse_address=False)
-        self.httpd.set_app(WSGIHandler())
+        self.httpd.set_app(handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="djrs-django", daemon=True)
 
     def start(self):
@@ -84,6 +108,17 @@ class _DjangoServer:
         self.httpd.server_close()
 
 
+def binary_info(binary):
+    """What the binary says about itself (`--djrs-info`)."""
+    import json
+
+    try:
+        out = subprocess.run([binary, "--djrs-info"], capture_output=True, timeout=30, check=True).stdout
+        return json.loads(out.decode("utf-8"))
+    except Exception:
+        return {}
+
+
 class DjrsTestRunner(DiscoverRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -91,6 +126,22 @@ class DjrsTestRunner(DiscoverRunner):
         self._tmpdir = None
         self._django = None
         self._proc = None
+        self._shared = None
+        self.commit = False
+        if self.binary:
+            choice = os.environ.get("DJRS_TEST_COMMIT", "auto")
+            if choice == "auto":
+                self.commit = binary_info(self.binary).get("native_views", 1) > 0
+            else:
+                self.commit = choice == "1"
+
+    def run_tests(self, *args, **kwargs):
+        from . import transport
+
+        failures = super().run_tests(*args, **kwargs)
+        if os.environ.get("DJRS_COMPARE_STRICT") == "1" and transport.mismatches:
+            failures += len(transport.mismatches)
+        return failures
 
     # -- environment ------------------------------------------------------------
 
@@ -105,6 +156,8 @@ class DjrsTestRunner(DiscoverRunner):
         if MIDDLEWARE_PATH not in settings.MIDDLEWARE:
             settings.MIDDLEWARE = [MIDDLEWARE_PATH] + list(settings.MIDDLEWARE)
 
+        if not self.commit:
+            return
         # Commit test data so a second process (the binary) can read it.
         TestCase._databases_support_transactions = classmethod(lambda cls: False)
 
@@ -140,6 +193,12 @@ class DjrsTestRunner(DiscoverRunner):
                 "DJRS_LOG": os.environ.get("DJRS_LOG", "warn"),
             }
         )
+        from django.conf import settings
+
+        # Test-only copies of the secrets, so the binary can read sessions.
+        env["DJRS_SECRET_KEY"] = settings.SECRET_KEY
+        fallbacks = getattr(settings, "SECRET_KEY_FALLBACKS", None) or []
+        env["DJRS_SECRET_KEY_FALLBACKS"] = ",".join(fallbacks)
         conf = connections["default"].settings_dict
         env["DJRS_DATABASE_ENGINE"] = conf.get("ENGINE", "")
         env["DJRS_DATABASE_NAME"] = str(conf.get("NAME", ""))
@@ -148,17 +207,48 @@ class DjrsTestRunner(DiscoverRunner):
         return env
 
     def _start(self):
-        self._django = _DjangoServer()
+        shared = None
+        if not self.commit:
+            from django.core.signals import request_finished, request_started
+            from django.db import close_old_connections, connections
+
+            # The in-process test client does the same: requests must not
+            # close the test's connection.
+            request_started.disconnect(close_old_connections)
+            request_finished.disconnect(close_old_connections)
+            shared = {}
+            for alias in connections:
+                conn = connections[alias]
+                conn.inc_thread_sharing()
+                shared[alias] = conn
+            self._shared = shared
+        self._django = _DjangoServer(shared)
         self._django.start()
         listen = _free_port()
         self._proc = subprocess.Popen([self.binary], env=self._binary_env(self._django.port, listen))
         _wait_for_port(listen, self._proc)
-        install_transport("http://127.0.0.1:%d" % listen)
+        compare = os.environ.get("DJRS_COMPARE") == "1"
+        install_transport("http://127.0.0.1:%d" % listen, "http://127.0.0.1:%d" % self._django.port if compare else None)
         if self.verbosity >= 1:
-            print("djrs: tests go through %s on port %d (Django on port %d)" % (self.binary, listen, self._django.port))
+            mode = "test data committed" if self.commit else "forward-only, shared test connection"
+            print("djrs: tests go through %s on port %d (Django on port %d; %s)" % (self.binary, listen, self._django.port, mode))
 
     def _stop(self):
+        from . import transport
+
         uninstall_transport()
+        if os.environ.get("DJRS_COMPARE") == "1":
+            print("djrs: compared %d GET responses with Django: %d differ" % (transport.compared[0], len(transport.mismatches)))
+            for m in transport.mismatches:
+                print("  %s" % m["url"])
+                for d in m["diffs"]:
+                    print("    %s" % d)
+            report = os.environ.get("DJRS_COMPARE_REPORT")
+            if report:
+                import json
+
+                with open(report, "w") as f:
+                    json.dump({"compared": transport.compared[0], "mismatches": transport.mismatches}, f, indent=1)
         if self._proc is not None:
             self._proc.terminate()
             try:
@@ -167,3 +257,12 @@ class DjrsTestRunner(DiscoverRunner):
                 self._proc.kill()
         if self._django is not None:
             self._django.stop()
+        if self._shared:
+            from django.core.signals import request_finished, request_started
+            from django.db import close_old_connections
+
+            for conn in self._shared.values():
+                conn.dec_thread_sharing()
+            request_started.connect(close_old_connections)
+            request_finished.connect(close_old_connections)
+            self._shared = None

@@ -6,16 +6,61 @@
 //! running on an internal port.
 
 pub mod app;
+pub mod auth;
 pub mod config;
+pub mod db;
+pub mod drf;
+pub mod orm;
 pub mod proxy;
+pub mod py;
 pub mod server;
+pub mod settings;
+pub mod signing;
 pub mod urls;
 
 pub use app::{App, Dispatcher, Handler, HandlerFuture, NativeRequest, Outcome, State};
 pub use config::Config;
+// Re-exported for macros used by generated code.
+pub use indexmap;
+
+async fn connect_db(app: &App) -> Option<db::Db> {
+    let settings = app.settings?;
+    let loc = match db::DbLocation::from_env() {
+        Ok(Some(loc)) => loc,
+        Ok(None) => {
+            tracing::warn!("DJRS_DATABASE_ENGINE not set: every request goes to Django");
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "database settings: every request goes to Django");
+            return None;
+        }
+    };
+    let max = std::env::var("DJRS_DATABASE_POOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    match db::Db::connect(&loc, &settings.db, max).await {
+        Ok(db) => Some(db),
+        Err(e) => {
+            tracing::error!(error = %e, "database connection failed: every request goes to Django");
+            None
+        }
+    }
+}
 
 /// Entry point used by generated `main.rs`: read config, log, serve until SIGTERM.
 pub fn run(app: App) {
+    if std::env::args().any(|a| a == "--djrs-info") {
+        // Used by djrs.testing to choose how test data is shared.
+        println!(
+            "{{\"app\": {:?}, \"native_views\": {}, \"runtime\": {:?}}}",
+            app.name,
+            app.native_views(),
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("DJRS_LOG")
@@ -36,7 +81,15 @@ pub fn run(app: App) {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let dispatcher = Dispatcher::new(app, config);
+    let secrets = settings::Secrets::from_env();
+    // Connect only when there is something to answer in Rust. If the database
+    // can't be reached, every request goes to Django.
+    let db = if app.native_views() > 0 && !config.forward_all {
+        runtime.block_on(connect_db(&app))
+    } else {
+        None
+    };
+    let dispatcher = Dispatcher::with_db(app, config, db, secrets);
     if let Err(e) = runtime.block_on(server::serve(dispatcher)) {
         eprintln!("djrs: {e}");
         std::process::exit(1);

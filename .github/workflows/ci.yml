@@ -44,3 +44,41 @@ jobs:
           uv venv --python ${{ matrix.python }} .venv
           uv pip install --python .venv/bin/python "django==${{ matrix.django }}" "djangorestframework==${{ matrix.drf }}" -e .
       - run: PYTHON=$PWD/.venv/bin/python scripts/e2e.sh
+
+  # The sample project on MySQL and PostgreSQL (Django 5.2).
+  e2e-databases:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [mysql, postgres]
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: notes
+        ports: ["3306:3306"]
+        options: --health-cmd="mysqladmin ping -proot" --health-interval=5s --health-retries=20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pg
+        ports: ["5432:5432"]
+        options: --health-cmd="pg_isready -U postgres" --health-interval=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo apt-get install -y default-libmysqlclient-dev pkg-config
+      - run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python "django==5.2.*" "djangorestframework==3.16.*" mysqlclient "psycopg[binary]" -e .
+      - name: e2e on ${{ matrix.db }}
+        run: |
+          if [ "${{ matrix.db }}" = mysql ]; then
+            export NOTES_DB_ENGINE=django.db.backends.mysql NOTES_DB_NAME=notes NOTES_DB_USER=root NOTES_DB_PASSWORD=root NOTES_DB_HOST=127.0.0.1 NOTES_DB_PORT=3306
+          else
+            export NOTES_DB_ENGINE=django.db.backends.postgresql NOTES_DB_NAME=postgres NOTES_DB_USER=postgres NOTES_DB_PASSWORD=pg NOTES_DB_HOST=127.0.0.1 NOTES_DB_PORT=5432
+          fi
+          PYTHON=$PWD/.venv/bin/python scripts/e2e.sh

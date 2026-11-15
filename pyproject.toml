@@ -11,7 +11,8 @@ readme = "README.md"
 # environment, so they must work on old Pythons too. Keep this package free of
 # syntax newer than 3.7 (no walrus, no match, no `X | Y` annotations).
 requires-python = ">=3.7"
-dependencies = []
+# tomli reads djrs.toml on Pythons without tomllib (< 3.11).
+dependencies = ["tomli>=1.1.0; python_version < '3.11'"]
 
 [project.scripts]
 djrs = "djrs.cli:main"

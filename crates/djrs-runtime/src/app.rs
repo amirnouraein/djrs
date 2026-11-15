@@ -20,7 +20,10 @@ use http::{Method, Request, Response};
 use http_body_util::BodyExt;
 
 use crate::config::Config;
+use crate::db::Db;
+use crate::drf::{DrfHandler, DrfView};
 use crate::proxy::Forwarder;
+use crate::settings::{ProjectSettings, Secrets};
 use crate::urls::{Match, Resolution, UrlTree};
 
 /// A request a Rust handler can read: head, whole body, client address.
@@ -45,15 +48,29 @@ pub enum Outcome {
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Outcome> + Send>>;
 pub type Handler = fn(Arc<State>, NativeRequest, Match) -> HandlerFuture;
 
-/// Shared state handed to handlers (database pool and the like, later).
+/// Shared state handed to handlers.
 pub struct State {
     pub config: Config,
+    pub settings: Option<&'static ProjectSettings>,
+    pub db: Option<Db>,
+    pub secrets: Secrets,
+}
+
+/// How a view is answered in Rust.
+#[derive(Clone, Copy)]
+enum Native {
+    /// A plain handler for one method.
+    Raw(Handler),
+    /// A DRF view: DRF's request cycle around per-method handlers.
+    Drf(&'static DrfView, &'static [(&'static str, DrfHandler)]),
 }
 
 pub struct App {
     pub name: &'static str,
     pub tree: UrlTree,
-    handlers: HashMap<(&'static str, Method), Handler>,
+    pub settings: Option<&'static ProjectSettings>,
+    raw: HashMap<(&'static str, Method), Handler>,
+    drf: HashMap<&'static str, Native>,
 }
 
 impl App {
@@ -61,20 +78,67 @@ impl App {
         App {
             name,
             tree,
-            handlers: HashMap::new(),
+            settings: None,
+            raw: HashMap::new(),
+            drf: HashMap::new(),
         }
     }
 
+    pub fn settings(mut self, settings: &'static ProjectSettings) -> App {
+        self.settings = Some(settings);
+        self
+    }
+
     pub fn handler(mut self, view: &'static str, method: Method, handler: Handler) -> App {
-        self.handlers.insert((view, method), handler);
+        self.raw.insert((view, method), handler);
+        self
+    }
+
+    /// Answer a DRF view in Rust for the given methods. Other methods it
+    /// doesn't allow get DRF's 405 from Rust; methods it allows but that have
+    /// no handler here go to Django.
+    pub fn drf_view(
+        mut self,
+        view: &'static DrfView,
+        handlers: &'static [(&'static str, DrfHandler)],
+    ) -> App {
+        self.drf.insert(view.id, Native::Drf(view, handlers));
         self
     }
 
     pub fn native_views(&self) -> usize {
-        let mut views: Vec<&str> = self.handlers.keys().map(|(v, _)| *v).collect();
+        let mut views: Vec<&str> = self
+            .raw
+            .keys()
+            .map(|(v, _)| *v)
+            .chain(self.drf.keys().copied())
+            .collect();
         views.sort_unstable();
         views.dedup();
         views.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.raw.is_empty() && self.drf.is_empty()
+    }
+
+    fn lookup(&self, view: &str, method: &Method) -> Option<Native> {
+        if let Some(h) = self.raw.get(&(view, method.clone())) {
+            return Some(Native::Raw(*h));
+        }
+        match self.drf.get(view) {
+            Some(Native::Drf(v, handlers)) => {
+                let m = method.as_str();
+                let translated = handlers.iter().any(|(hm, _)| *hm == m);
+                let disallowed = !v.allowed_methods.contains(&m) && m != "HEAD";
+                if translated || disallowed {
+                    Some(Native::Drf(v, handlers))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -92,10 +156,20 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(app: App, config: Config) -> Dispatcher {
+        Dispatcher::with_db(app, config, None, Secrets::default())
+    }
+
+    pub fn with_db(app: App, config: Config, db: Option<Db>, secrets: Secrets) -> Dispatcher {
         let forwarder = Forwarder::new(&config.upstream, config.forwarded_headers);
+        let settings = app.settings;
         Dispatcher {
             app,
-            state: Arc::new(State { config }),
+            state: Arc::new(State {
+                config,
+                settings,
+                db,
+                secrets,
+            }),
             forwarder,
         }
     }
@@ -109,13 +183,16 @@ impl Dispatcher {
     }
 
     /// Which way a request goes, and why (the reason is logged, never sent).
-    pub fn decide(&self, method: &Method, raw_path: &str) -> (Decision, Option<(Handler, Match)>) {
+    fn decide(&self, method: &Method, raw_path: &str) -> (Decision, Option<(Native, Match)>) {
         let cfg = &self.state.config;
         if cfg.forward_all {
             return (Decision::Forward("forward-all switch"), None);
         }
-        if self.app.handlers.is_empty() {
+        if self.app.is_empty() {
             return (Decision::Forward("no Rust handlers"), None);
+        }
+        if self.state.db.is_none() {
+            return (Decision::Forward("no database connection"), None);
         }
         let path = match path_info(raw_path) {
             Some(p) => p,
@@ -128,8 +205,8 @@ impl Dispatcher {
                 if cfg.force_forward.contains(m.view) {
                     return (Decision::Forward("view switched to Django"), None);
                 }
-                match self.app.handlers.get(&(m.view, method.clone())) {
-                    Some(h) => (Decision::Native(m.view), Some((*h, m))),
+                match self.app.lookup(m.view, method) {
+                    Some(h) => (Decision::Native(m.view), Some((h, m))),
                     None => (Decision::Forward("view or method not translated"), None),
                 }
             }
@@ -164,7 +241,13 @@ impl Dispatcher {
             }
         };
         let native = NativeRequest { parts, body, peer };
-        match handler(self.state.clone(), native, m).await {
+        let outcome = match handler {
+            Native::Raw(h) => h(self.state.clone(), native, m).await,
+            Native::Drf(view, handlers) => {
+                crate::drf::dispatch(self.state.clone(), native, m, view, handlers).await
+            }
+        };
+        match outcome {
             Outcome::Respond(resp) => resp,
             Outcome::Forward(native) => {
                 let peer = native.peer;

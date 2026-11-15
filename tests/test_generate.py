@@ -41,7 +41,7 @@ def _ir():
     return {
         "djrs": {"version": "0", "schema": 1},
         "project": {"settings_module": "demo.settings"},
-        "settings": {},
+        "settings": {"TIME_ZONE": "UTC", "USE_TZ": True},
         "databases": {"default": {"vendor": "sqlite"}},
         "middleware": [{"path": "django.middleware.common.CommonMiddleware"}],
         "url_semantics": {"regex_endpoint_fullmatch_on_dollar": True, "drop_none_kwargs": True},
@@ -115,3 +115,41 @@ class GenerateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandlerConfigTests(unittest.TestCase):
+    def _drf_view(self, **drf):
+        base = {
+            "authentication_classes": ["rest_framework.authentication.TokenAuthentication"],
+            "permission_classes": ["rest_framework.permissions.IsAuthenticated"],
+            "renderer_classes": ["rest_framework.renderers.JSONRenderer"],
+            "parser_classes": ["rest_framework.parsers.JSONParser"],
+            "throttle_classes": [],
+            "content_negotiation_class": "rest_framework.negotiation.DefaultContentNegotiation",
+            "versioning_class": None,
+        }
+        base.update(drf)
+        return {"kind": "drf_function", "methods": ["GET"], "allowed_methods": ["GET", "OPTIONS"], "drf": base, "function": {"refs": {}}}
+
+    def test_registered_view(self):
+        from djrs.generate import handlers
+
+        data = _ir()
+        data["views"]["demo.views.a"] = self._drf_view()
+        config = {"shims": {"demo_shims": "rust/demo.rs"}, "drf_handlers": {"demo.views.a": {"GET": "demo_shims::a"}}}
+        body, decls, status = handlers.build(data, config, "/proj", "/proj/gateway/src", [])
+        self.assertEqual(status, {"demo.views.a": []})
+        self.assertIn("Authenticator::Token", body)
+        self.assertIn('(r#"GET"#, crate::demo_shims::a)', body)
+        self.assertIn('#[path = "../../rust/demo.rs"]', decls)
+
+    def test_unsupported_drf_setup_is_reported(self):
+        from djrs.generate import handlers
+
+        data = _ir()
+        data["views"]["demo.views.a"] = self._drf_view(throttle_classes=["x.Throttle"], permission_classes=["x.Custom"])
+        config = {"drf_handlers": {"demo.views.a": {"GET": "m::a"}}}
+        _, _, status = handlers.build(data, config, "/p", "/p/g/src", ["middleware x is not supported"])
+        self.assertIn("middleware x is not supported", status["demo.views.a"])
+        self.assertIn("throttling is not supported yet", status["demo.views.a"])
+        self.assertIn("permission class x.Custom is not supported", status["demo.views.a"])

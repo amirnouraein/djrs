@@ -17,7 +17,7 @@ import os
 
 from djrs import __version__, ir
 
-from . import pyregex
+from . import entities, handlers, pyregex, settings_rs
 from .eligibility import project_blockers, view_blockers
 from .rust import crate_name, json_literal, raw_str
 
@@ -112,33 +112,53 @@ def _runtime_dep(runtime, out_dir):
     return '{ git = "https://github.com/amirnouraein/djrs", tag = "v%s" }' % __version__
 
 
-def generate(data, out_dir, name=None, runtime=None, path_base=None):
+def generate(data, out_dir, name=None, runtime=None, path_base=None, config=None, config_dir=None):
     """Write the crate into out_dir. `path_base` is the directory the crate will
-    finally live in (relative paths are computed from it); defaults to out_dir."""
+    finally live in (relative paths are computed from it); defaults to out_dir.
+    `config` is the parsed djrs.toml (or None) and `config_dir` its directory."""
     name = crate_name(name or (data["project"].get("settings_module") or "app").split(".")[0] + "-gateway")
     header = HEADER.format(version=__version__)
+    final_dir = os.path.abspath(path_base or out_dir)
 
     # ---- decide every view --------------------------------------------------
     blockers = project_blockers(data)
+    settings_src, settings_problems = settings_rs.build(data)
+    blockers = blockers + settings_problems
+    handlers_body, shim_decls, handled = handlers.build(
+        data, config, config_dir or os.getcwd(), os.path.join(final_dir, "src"), blockers
+    )
     urls_by_view = _url_index(data["urls"])
     views = {}
     for view_id, view in sorted(data["views"].items()):
-        # Project-wide blockers are reported once, not on every view.
-        reasons = view_blockers(view, data)
-        # Translation itself arrives in a later milestone; until then every
-        # view that passes the checks is still forwarded, with that reason.
-        if not reasons:
-            reasons = ["translator: not implemented yet"]
+        if handled.get(view_id) == []:
+            status, reasons = "rust", ["hand-written handler (djrs.toml)"]
+        else:
+            # Project-wide blockers are reported once, not on every view.
+            reasons = handled.get(view_id) or view_blockers(view, data)
+            reasons = [r for r in reasons if r not in blockers]
+            # Translation arrives in a later milestone; until then every view
+            # without a hand-written handler is forwarded, with that reason.
+            if not reasons:
+                reasons = ["translator: not implemented yet"]
+            status = "django"
         views[view_id] = {
             "kind": view.get("kind"),
             "methods": view.get("methods"),
             "urls": urls_by_view.get(view_id, []),
-            "status": "django" if (reasons or blockers) else "rust",
+            "status": status,
             "reasons": reasons,
         }
     report = Report(blockers, views)
 
     # ---- files ---------------------------------------------------------------
+    entities_src, model_report = entities.build(data)
+    entities_rs = (
+        header
+        + "\n"
+        + "//! One SeaORM entity per concrete model, typed as Django stores it on this database.\n"
+        + "#![allow(dead_code)]\n\n"
+        + entities_src
+    )
     opaque_notes = []
     tree_expr = _node_expr(data["urls"], 2, opaque_notes)
     sem = data.get("url_semantics") or {}
@@ -155,22 +175,17 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None):
         + tree_expr
         + ",\n    )\n}\n"
     )
-    handlers_rs = (
-        header
-        + "\n"
-        + "use djrs_runtime::App;\n\n"
-        + "/// Registers every generated handler. Views without one are forwarded to Django.\n"
-        + "pub fn register(app: App) -> App {\n"
-        + "    app\n"
-        + "}\n"
-    )
+    handlers_rs = header + "\n" + handlers_body
     main_rs = (
         header
         + "\n"
+        + "mod entities;\n"
         + "mod handlers;\n"
-        + "mod routes;\n\n"
+        + "mod routes;\n"
+        + "mod settings;\n\n"
+        + ("// Hand-written Rust from djrs.toml [shims].\n" + shim_decls + "\n" if shim_decls else "")
         + "fn main() {\n"
-        + "    let app = djrs_runtime::App::new(%s, routes::tree());\n" % raw_str(name)
+        + "    let app = djrs_runtime::App::new(%s, routes::tree()).settings(&settings::SETTINGS);\n" % raw_str(name)
         + "    djrs_runtime::run(handlers::register(app));\n"
         + "}\n"
     )
@@ -183,6 +198,9 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None):
         + "publish = false\n\n"
         + "[dependencies]\n"
         + "djrs-runtime = %s\n" % _runtime_dep(runtime, path_base or out_dir)
+        + 'chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }\n'
+        + 'sea-orm = { version = "1.1", default-features = false, features = ["macros", "with-chrono", "with-json", "with-uuid", "with-rust_decimal"] }\n'
+        + 'rust_decimal = "1"\n'
         + 'serde_json = { version = "1", features = ["preserve_order"] }\n\n'
         + "[profile.release]\n"
         + "lto = true\n"
@@ -196,6 +214,7 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None):
         "opaque_patterns": sorted(set(opaque_notes)),
         "summary": {"views": len(views), "rust": report.counts()[0], "django": report.counts()[1]},
         "views": views,
+        "models": model_report,
     }
 
     _write(os.path.join(out_dir, "Cargo.toml"), cargo_toml)
@@ -203,6 +222,8 @@ def generate(data, out_dir, name=None, runtime=None, path_base=None):
     _write(os.path.join(out_dir, "src", "main.rs"), main_rs)
     _write(os.path.join(out_dir, "src", "routes.rs"), routes_rs)
     _write(os.path.join(out_dir, "src", "handlers.rs"), handlers_rs)
+    _write(os.path.join(out_dir, "src", "entities.rs"), entities_rs)
+    _write(os.path.join(out_dir, "src", "settings.rs"), header + "\n" + settings_src)
     _write(os.path.join(out_dir, "djrs-coverage.json"), ir.dumps(coverage))
     _write(os.path.join(out_dir, "COVERAGE.md"), _coverage_md(coverage))
     return report
@@ -240,6 +261,15 @@ def _coverage_md(cov):
         lines.append("")
         for p in cov["opaque_patterns"]:
             lines.append("- `%s`" % p)
+        lines.append("")
+    partial = {k: v for k, v in sorted(cov.get("models", {}).items()) if not v["complete"]}
+    if partial:
+        lines.append("## Models Rust can't fully write")
+        lines.append("")
+        lines.append("| Model | Left out |")
+        lines.append("| --- | --- |")
+        for label, v in partial.items():
+            lines.append("| `%s` | %s |" % (label, "; ".join(v["skipped"]).replace("|", "\\|")))
         lines.append("")
     lines.append("## Views")
     lines.append("")

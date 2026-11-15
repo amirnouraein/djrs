@@ -23,8 +23,11 @@ def _cmd_generate(args):
     from djrs import ir
     from djrs.generate import generate
 
+    from djrs.generate.handlers import load_config
+
     data = ir.read(args.ir)
-    report = generate(data, args.out, name=args.name, runtime=args.runtime)
+    config, config_dir = load_config(args.config)
+    report = generate(data, args.out, name=args.name, runtime=args.runtime, config=config, config_dir=config_dir)
     print(report.summary(), file=sys.stderr)
 
 
@@ -37,9 +40,12 @@ def _cmd_check(args):
     from djrs import ir
     from djrs.generate import generate
 
+    from djrs.generate.handlers import load_config
+
     data = ir.read(args.ir)
+    config, config_dir = load_config(args.config)
     with tempfile.TemporaryDirectory() as tmp:
-        generate(data, tmp, name=args.name, runtime=args.runtime, path_base=args.out)
+        generate(data, tmp, name=args.name, runtime=args.runtime, path_base=args.out, config=config, config_dir=config_dir)
         diffs = []
         for root, _dirs, files in os.walk(tmp):
             for f in files:
@@ -72,6 +78,7 @@ def main(argv=None):
         p.add_argument("ir", help="JSON written by `djrs extract`")
         p.add_argument("--out", required=True, help="crate directory")
         p.add_argument("--name", default=None, help="crate and binary name (default: from the settings module)")
+        p.add_argument("--config", default=None, help="the project's djrs.toml (hand-written handlers, shims)")
         p.add_argument(
             "--runtime",
             default=None,

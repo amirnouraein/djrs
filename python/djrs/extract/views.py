@@ -529,6 +529,15 @@ class Extractor:
 
         if drf_cls is not None and APIView is not None and inspect.isclass(drf_cls) and issubclass(drf_cls, APIView):
             out["drf"] = self._drf_settings(drf_cls)
+            # The Allow header lists methods in http_method_names order. For
+            # @api_view that list comes from a set, so its order is whatever
+            # this process got; any order is what some Django worker would send.
+            allowed = [m.upper() for m in drf_cls.http_method_names if hasattr(drf_cls, m)]
+            if "WrappedAPIView" in getattr(drf_cls, "__qualname__", ""):
+                # Set order differs per process (hash seed); use Django's own
+                # method order so the IR stays deterministic.
+                allowed.sort(key=lambda m: HTTP_METHODS.index(m.lower()) if m.lower() in HTTP_METHODS else 99)
+            out["allowed_methods"] = allowed
             out["initkwargs"] = to_json(getattr(callback, "initkwargs", None))
             # @api_view builds a class named WrappedAPIView, then renames it
             # (__name__, __module__) after the decorated function; the

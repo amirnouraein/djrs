@@ -111,6 +111,112 @@ def settings_snapshot():
     return out
 
 
+def auth_facts():
+    """How this Django version signs sessions and hashes passwords, found by
+    running Django's own code on throwaway values (no database, no real secret)."""
+    from django.conf import settings
+    from django.contrib.auth import get_user_model
+    from django.utils.crypto import salted_hmac
+
+    out = {}
+    User = get_user_model()
+    meta = User._meta
+
+    def column(name):
+        try:
+            return meta.get_field(name).column
+        except Exception:
+            return None
+
+    out["user"] = {
+        "model": meta.label,
+        "table": meta.db_table,
+        "pk_column": meta.pk.column,
+        "pk_type": meta.pk.get_internal_type(),
+        "password_column": column("password"),
+        "is_active_column": column("is_active"),
+        "is_staff_column": column("is_staff"),
+        "is_superuser_column": column("is_superuser"),
+        "username_field": getattr(User, "USERNAME_FIELD", None),
+        "username_column": column(getattr(User, "USERNAME_FIELD", "username")),
+        "is_active_attr": type(getattr(User, "is_active", None)).__name__,
+    }
+
+    try:
+        from django.contrib.auth.hashers import get_hasher
+
+        hasher = get_hasher("default")
+        out["default_hasher"] = {"algorithm": hasher.algorithm, "iterations": getattr(hasher, "iterations", None)}
+    except Exception as exc:
+        out["default_hasher"] = {"error": type(exc).__name__}
+
+    # Which HMAC get_session_auth_hash uses (sha1 up to 3.0, sha256 after).
+    key_salt = "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash"
+    probe = User()
+    probe.password = "probe$password$hash"
+    try:
+        expected = probe.get_session_auth_hash()
+        out["session_auth_hash"] = None
+        for alg in ("sha256", "sha1"):
+            try:
+                got = salted_hmac(key_salt, probe.password, algorithm=alg).hexdigest()
+            except TypeError:  # Django 3.0: no algorithm argument, always sha1
+                got = salted_hmac(key_salt, probe.password).hexdigest() if alg == "sha1" else None
+            if got == expected:
+                out["session_auth_hash"] = alg
+                break
+    except Exception as exc:
+        out["session_auth_hash"] = {"error": type(exc).__name__}
+
+    # Session storage format: Django 3.1+ uses django.core.signing, older uses
+    # a base64 "hash:json" blob.
+    try:
+        from importlib import import_module
+
+        from django.core import signing
+
+        engine = import_module(settings.SESSION_ENGINE)
+        store = engine.SessionStore()
+        encoded = store.encode({"probe": 1})
+        session = {"engine": settings.SESSION_ENGINE, "serializer": settings.SESSION_SERIALIZER}
+        try:
+            signing.loads(encoded, salt=store.key_salt, serializer=store.serializer)
+            session["format"] = "signed"
+            session["key_salt"] = store.key_salt
+            signer = signing.Signer(salt="probe")
+            session["signer_algorithm"] = getattr(signer, "algorithm", None) or "sha1"
+        except Exception:
+            session["format"] = "legacy"
+            session["key_salt"] = "django.contrib.sessions" + type(store).__name__
+        out["session"] = session
+    except Exception as exc:
+        out["session"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    return out
+
+
+def drf_messages():
+    """Default error messages of DRF's exceptions, as this DRF version says them."""
+    try:
+        from rest_framework import exceptions
+    except Exception:
+        return None
+    out = {}
+    for name in (
+        "NotAuthenticated",
+        "AuthenticationFailed",
+        "PermissionDenied",
+        "NotFound",
+        "MethodNotAllowed",
+        "ParseError",
+        "UnsupportedMediaType",
+        "NotAcceptable",
+    ):
+        cls = getattr(exceptions, name, None)
+        if cls is not None:
+            out[name] = {"detail": str(cls.default_detail), "code": cls.default_code, "status": cls.status_code}
+    return out
+
+
 def drf_settings():
     """DRF's effective settings (user values merged over DRF's own defaults)."""
     try:
@@ -146,9 +252,97 @@ def databases():
         # credentials do not belong here.
         entry["options"] = to_json(_scrub({k: v for k, v in options.items() if k not in ("passwd", "password", "read_default_file")}))
         entry["time_zone"] = conf.get("TIME_ZONE")
+        entry["connection"] = _connection_facts(connections[alias])
         entry["atomic_requests"] = bool(conf.get("ATOMIC_REQUESTS"))
         entry["test_mirror"] = (conf.get("TEST") or {}).get("MIRROR")
         out[alias] = entry
+    return out
+
+
+def _connection_facts(conn):
+    """Session settings Django applies when it connects (no connection is opened).
+
+    The Rust side must use the same ones, or the same SQL can behave
+    differently (character set, matched vs. changed row counts, isolation).
+    """
+    out = {}
+    try:
+        params = conn.get_connection_params()
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+    if conn.vendor == "mysql":
+        out["charset"] = params.get("charset")
+        out["found_rows"] = bool((params.get("client_flag") or 0) & 2)  # MySQLdb CLIENT.FOUND_ROWS
+        out["init_command"] = params.get("init_command")
+        out["isolation_level"] = getattr(conn, "isolation_level", None)
+        out["sql_auto_is_null_off"] = True
+    elif conn.vendor == "postgresql":
+        out["timezone_name"] = getattr(conn, "timezone_name", None)
+        options = conn.settings_dict.get("OPTIONS") or {}
+        out["isolation_level"] = to_json(options.get("isolation_level"))
+    elif conn.vendor == "sqlite":
+        out["foreign_keys"] = True
+    return out
+
+
+# Middleware the probe may run: Django's own and django-cors-headers. Others
+# could have side effects (caches, external calls), so they're never run.
+PROBE_SAFE_MIDDLEWARE_PREFIXES = ("django.", "corsheaders.")
+
+
+def response_header_probe():
+    """Run the project's middleware chain around a view that returns a small
+    JSON response, and record what headers come out, in order.
+
+    Done for plain HTTP, HTTPS, and a request whose session is read (which
+    adds `Vary: Cookie`). Django versions differ here (X-XSS-Protection went
+    away in 4.0, Cross-Origin-Opener-Policy arrived in 4.0); running Django's
+    own code records what this version does, with this project's settings.
+    """
+    from django.conf import settings
+    from django.http import HttpResponse
+    from django.test import RequestFactory
+    from django.utils.module_loading import import_string
+
+    paths = list(getattr(settings, "MIDDLEWARE", None) or [])
+    skipped = [p for p in paths if not p.startswith(PROBE_SAFE_MIDDLEWARE_PREFIXES)]
+    host = "testserver"
+    for h in settings.ALLOWED_HOSTS or []:
+        if h == "*":
+            break
+        host = "probe" + h if h.startswith(".") else h
+        break
+
+    def run(secure, touch_session):
+        def view(request):
+            if touch_session and hasattr(request, "session"):
+                request.session.get("probe")
+            return HttpResponse(b'{"probe":1}', content_type="application/json")
+
+        handler = view
+        for path in reversed(paths):
+            if path in skipped:
+                continue
+            try:
+                handler = import_string(path)(handler)
+            except Exception as exc:  # MiddlewareNotUsed and friends
+                if type(exc).__name__ != "MiddlewareNotUsed":
+                    raise
+        factory = RequestFactory()
+        extra = {"HTTP_HOST": host}
+        if secure:
+            extra["wsgi.url_scheme"] = "https"
+        request = factory.get("/__djrs_probe__/", **extra)
+        response = handler(request)
+        return [[k, v] for k, v in response.items()]
+
+    out = {"skipped_middleware": skipped, "host": host}
+    try:
+        out["http"] = run(False, False)
+        out["https"] = run(True, False)
+        out["http_session_read"] = run(False, True)
+    except Exception as exc:
+        out["error"] = "%s: %s" % (type(exc).__name__, exc)
     return out
 
 
