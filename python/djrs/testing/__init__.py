@@ -74,7 +74,7 @@ class _DjangoServer:
     the running TestCase transaction, as in-process requests do.
     """
 
-    def __init__(self, shared=None):
+    def __init__(self, shared=None, shared_caches=None):
         from django.core.handlers.wsgi import WSGIHandler
         from django.core.servers.basehttp import ThreadedWSGIServer, WSGIRequestHandler
 
@@ -89,6 +89,7 @@ class _DjangoServer:
             def shared_app(environ, start_response):
                 for alias, conn in shared.items():
                     connections[alias] = conn
+                _share_caches(shared_caches or {})
                 return app(environ, start_response)
 
             handler = shared_app
@@ -106,6 +107,20 @@ class _DjangoServer:
     def stop(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+
+
+def _share_caches(shared):
+    """Make this thread use the test thread's cache objects (Django keeps one
+    per thread), so a test's mock.patch on a cache reaches the request."""
+    if not shared:
+        return
+    from django.core.cache import caches
+
+    try:
+        for alias, cache in shared.items():
+            caches[alias] = cache  # Django 3.2+
+    except TypeError:
+        caches._caches.caches = dict(shared)  # Django <= 3.1
 
 
 def binary_info(binary):
@@ -222,7 +237,13 @@ class DjrsTestRunner(DiscoverRunner):
                 conn.inc_thread_sharing()
                 shared[alias] = conn
             self._shared = shared
-        self._django = _DjangoServer(shared)
+            from django.conf import settings
+            from django.core.cache import caches
+
+            shared_caches = {alias: caches[alias] for alias in getattr(settings, "CACHES", {})}
+        else:
+            shared_caches = None
+        self._django = _DjangoServer(shared, shared_caches)
         self._django.start()
         listen = _free_port()
         self._proc = subprocess.Popen([self.binary], env=self._binary_env(self._django.port, listen))
