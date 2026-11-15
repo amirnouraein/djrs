@@ -1,6 +1,7 @@
 import csv
-from datetime import timedelta
+from datetime import datetime, timedelta
 
+from django.db import transaction
 from django.db.models import Count, Max
 from django.http import HttpResponse
 from django.utils import timezone
@@ -12,8 +13,8 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Note, Tag
-from .serializers import NoteDetailSerializer, NoteSerializer, TagSerializer
+from .models import Note, Reminder, Tag
+from .serializers import NoteDetailSerializer, NoteOverviewSerializer, NoteSerializer, ReminderSerializer, TagSerializer
 
 
 @require_GET
@@ -179,6 +180,51 @@ def priority_stats(request):
     # aggregate() isn't translated: this view has a hand-written Rust handler (djrs.toml).
     stats = Note.objects.filter(owner=request.user).aggregate(top=Max("priority"), total=Count("id"))
     return Response({"top": stats["top"], "total": stats["total"]})
+
+
+def _error(message, code=status.HTTP_400_BAD_REQUEST):
+    return Response({"status": "error", "error": message}, status=code)
+
+
+@api_view(["POST"])
+def add_reminder(request, note_id):
+    try:
+        note = Note.objects.get(pk=note_id, owner=request.user)
+    except Note.DoesNotExist:
+        return _error("Note not found", code=status.HTTP_404_NOT_FOUND)
+    label = request.data.get("label", "")
+    try:
+        due = datetime.strptime(request.data.get("due"), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return _error("due must be YYYY-MM-DD")
+    with transaction.atomic():
+        reminder = Reminder.objects.create(note=note, label=label, due=due)
+    return Response(ReminderSerializer(reminder).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+def get_reminder(request):
+    rid = request.query_params.get("id")
+    reminder = Reminder.objects.filter(pk=rid).first()
+    if reminder is None or reminder.note.owner != request.user:
+        return _error("Reminder not found", code=status.HTTP_404_NOT_FOUND)
+    return Response(
+        {
+            "reminder": ReminderSerializer(reminder).data,
+            "id": str(reminder.id),
+            # A UUID never equals its string form in Python.
+            "same_as_query": reminder.id == rid,
+            "due": f"{reminder.due}",
+        }
+    )
+
+
+@api_view(["GET"])
+def note_overview(request, note_id):
+    note = Note.objects.filter(pk=note_id, owner=request.user).first()
+    if not note:
+        return _error("Note not found", code=status.HTTP_404_NOT_FOUND)
+    return Response(NoteOverviewSerializer(note).data)
 
 
 @api_view(["GET"])

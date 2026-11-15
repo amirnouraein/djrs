@@ -319,6 +319,86 @@ pub fn dict_update(d: &mut Py, other: &Py) -> Result<(), Stop> {
     }
 }
 
+/// `sep.join(items)`: every item must be a str (TypeError otherwise).
+pub fn join(sep: &Py, items: &Py) -> Result<Py, Stop> {
+    let sep = match sep {
+        Py::Str(s) => s,
+        _ => return fwd(".join() on a value that isn't a str"),
+    };
+    let mut parts = Vec::new();
+    for item in iter(items)? {
+        match item {
+            Py::Str(s) => parts.push(s),
+            _ => return fwd(".join() of a non-str item"),
+        }
+    }
+    Ok(Py::Str(parts.join(sep)))
+}
+
+/// `datetime.strptime(s, "%Y-%m-%d").date()`, matching CPython's `_strptime`:
+/// `%Y` is 4 digits, `%m` is `1[0-2]|0[1-9]|[1-9]`, `%d` is
+/// `3[01]|[12]\d|0[1-9]|[1-9]| [1-9]`; the first match (in that order) must
+/// cover the whole string; then the date must exist. Anything else raises.
+pub fn strptime_ymd(v: &Py) -> Result<chrono::NaiveDate, Stop> {
+    let s = match v {
+        Py::Str(s) => s.as_bytes(),
+        _ => return fwd("strptime() of a non-str (TypeError)"),
+    };
+    let digit = |i: usize| s.get(i).map_or(false, |b| b.is_ascii_digit());
+    if !(0..4).all(digit) || s.get(4) != Some(&b'-') {
+        return fwd("strptime() doesn't match");
+    }
+    let year: i32 = std::str::from_utf8(&s[..4]).unwrap().parse().unwrap();
+    let at = |i: usize| s.get(i).copied();
+    // Month alternatives, in regex order; each gives (value, length).
+    let months: Vec<(u32, usize)> = {
+        let mut m = Vec::new();
+        if at(5) == Some(b'1') && matches!(at(6), Some(b'0'..=b'2')) {
+            m.push((10 + (at(6).unwrap() - b'0') as u32, 2));
+        }
+        if at(5) == Some(b'0') && matches!(at(6), Some(b'1'..=b'9')) {
+            m.push(((at(6).unwrap() - b'0') as u32, 2));
+        }
+        if matches!(at(5), Some(b'1'..=b'9')) {
+            m.push(((at(5).unwrap() - b'0') as u32, 1));
+        }
+        m
+    };
+    for (month, ml) in months {
+        let p = 5 + ml;
+        if at(p) != Some(b'-') {
+            continue;
+        }
+        let d = p + 1;
+        let day: Option<(u32, usize)> =
+            if at(d) == Some(b'3') && matches!(at(d + 1), Some(b'0' | b'1')) {
+                Some((30 + (at(d + 1).unwrap() - b'0') as u32, 2))
+            } else if matches!(at(d), Some(b'1' | b'2')) && digit(d + 1) {
+                Some((
+                    (at(d).unwrap() - b'0') as u32 * 10 + (at(d + 1).unwrap() - b'0') as u32,
+                    2,
+                ))
+            } else if at(d) == Some(b'0') && matches!(at(d + 1), Some(b'1'..=b'9')) {
+                Some(((at(d + 1).unwrap() - b'0') as u32, 2))
+            } else if matches!(at(d), Some(b'1'..=b'9')) {
+                Some(((at(d).unwrap() - b'0') as u32, 1))
+            } else if at(d) == Some(b' ') && matches!(at(d + 1), Some(b'1'..=b'9')) {
+                Some(((at(d + 1).unwrap() - b'0') as u32, 2))
+            } else {
+                None
+            };
+        // The regex matched with this month; the rest decides.
+        if let Some((day, dl)) = day {
+            if d + dl != s.len() {
+                return fwd("strptime(): unconverted data remains");
+            }
+            return chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .ok_or(Stop::Forward("invalid date"));
+        }
+    }
+    fwd("strptime() doesn't match")
+}
+
 /// `x.append(value)`.
 pub fn append(v: &mut Py, value: Py) -> Result<(), Stop> {
     match v {
@@ -467,6 +547,27 @@ mod tests {
         assert_eq!(add(&Py::Int(1), &Py::Float(0.5)).unwrap(), Py::Float(1.5));
         assert!(add(&Py::Int(i64::MAX), &Py::Int(1)).is_err());
         assert!(add(&Py::Str("a".into()), &Py::Int(1)).is_err());
+    }
+
+    #[test]
+    fn strptime_matches_python() {
+        let d = |s: &str| strptime_ymd(&Py::Str(s.into())).ok().map(|d| d.to_string());
+        assert_eq!(d("2024-02-29").as_deref(), Some("2024-02-29"));
+        assert_eq!(d("2024-1-5").as_deref(), Some("2024-01-05"));
+        assert_eq!(d("2024-01- 5").as_deref(), Some("2024-01-05"));
+        assert_eq!(d("2023-02-29"), None); // no such day
+        assert_eq!(d("2024-01-32"), None); // "unconverted data remains"
+        assert_eq!(d("24-01-01"), None);
+        assert_eq!(d("2024-13-01"), None);
+        assert!(strptime_ymd(&Py::Int(1)).is_err());
+        assert_eq!(
+            join(
+                &Py::Str(", ".into()),
+                &Py::List(vec![Py::Str("a".into()), Py::Str("b".into())])
+            )
+            .unwrap(),
+            Py::Str("a, b".into())
+        );
     }
 
     #[test]

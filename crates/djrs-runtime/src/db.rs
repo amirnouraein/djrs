@@ -356,6 +356,26 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn uuid_parsing_follows_python() {
+        let want = "12345678-1234-5678-1234-567812345678";
+        for ok in [
+            "12345678123456781234567812345678",
+            "{12345678-1234-5678-1234-567812345678}",
+            "urn:uuid:12345678-1234-5678-1234-567812345678",
+            "1234urn:5678123456781234567812345678",
+        ] {
+            assert_eq!(DjUuid::parse(ok).unwrap().hyphenated(), want, "{ok}");
+        }
+        for bad in [
+            " 12345678123456781234567812345678",
+            "1234",
+            "g2345678123456781234567812345678",
+        ] {
+            assert!(DjUuid::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
     fn datetime_formats() {
         let whole = Utc.with_ymd_and_hms(2026, 11, 15, 5, 0, 0).unwrap();
         let frac = whole + chrono::Duration::microseconds(123456);
@@ -395,18 +415,25 @@ impl DjUuid {
     pub fn hyphenated(&self) -> String {
         self.0.hyphenated().to_string()
     }
-    /// Python's `uuid.UUID(s)`: accepts hex with or without hyphens, braces, a urn prefix.
+    /// Python's `uuid.UUID(s)`: `s.replace('urn:', '').replace('uuid:', '')`,
+    /// braces stripped from both ends, hyphens removed, then 32 hex digits.
+    /// (Python's `int(hex, 16)` also takes `_`, a sign or spaces; such
+    /// strings give None here, and the request goes to Django.)
     pub fn parse(s: &str) -> Option<DjUuid> {
-        let t = s
-            .trim()
-            .trim_start_matches("urn:")
-            .trim_start_matches("uuid:");
+        let t = s.replace("urn:", "").replace("uuid:", "");
         let t = t.trim_matches(|c| c == '{' || c == '}');
         let hex: String = t.chars().filter(|c| *c != '-').collect();
-        if hex.len() != 32 {
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        uuid::Uuid::parse_str(&hex).ok().map(DjUuid)
+        u128::from_str_radix(&hex, 16)
+            .ok()
+            .map(|n| DjUuid(uuid::Uuid::from_u128(n)))
+    }
+
+    /// `uuid.uuid4()`.
+    pub fn new_v4() -> DjUuid {
+        DjUuid(uuid::Uuid::new_v4())
     }
 }
 

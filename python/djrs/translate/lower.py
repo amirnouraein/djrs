@@ -43,13 +43,18 @@ class T:
 
 
 class PyT(T):
-    """A plain Python value. `kind` is its Python type when statically known."""
+    """A plain Python value. `kind` is its Python type when statically known.
 
-    def __init__(self, kind=None):
+    `tainted`: somewhere inside, Python holds a UUID object where the Rust
+    holds its string form. Such a value can be stored and returned (DRF
+    renders a UUID as that string) but not inspected."""
+
+    def __init__(self, kind=None, tainted=False):
         self.kind = kind
+        self.tainted = tainted
 
     def key(self):
-        return (self.kind,)
+        return (self.kind, self.tainted)
 
 
 class ModelT(T):
@@ -122,6 +127,14 @@ DATETIME = Simple("datetime")
 TIMEDELTA_CLS = Simple("timedelta class")
 TIMEDELTA = Simple("timedelta")
 DELETE_RESULT = Simple("delete() result")
+DATE = Simple("datetime.date")
+NAIVE_DT = Simple("naive datetime")
+STRPTIME = Simple("datetime.strptime")
+SER_SELF = Simple("serializer self")
+ATOMIC = Simple("transaction.atomic")
+UUID = Simple("uuid.UUID")
+UUID_CLS = Simple("uuid.UUID class")
+UUID4_FN = Simple("uuid.uuid4")
 OPAQUE = Simple("unusable value")
 
 
@@ -228,13 +241,14 @@ def fresh(node):
 
 
 def mutated_names(fn):
-    """Variables changed in place: `x[k] = v`, `x.append(v)`, `x += v`."""
+    """Variables changed in place: `x[k] = v`, `x.append(v)`, `x += v`, and
+    model instances: `obj.field = v`, `obj.save()`, `obj.delete()`."""
     out = set()
     for node in ast.walk(fn):
-        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) and isinstance(node.value, ast.Name):
+        if isinstance(node, (ast.Subscript, ast.Attribute)) and isinstance(node.ctx, ast.Store) and isinstance(node.value, ast.Name):
             out.add(node.value.id)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-            if node.func.attr in ("append",):
+            if node.func.attr in ("append", "update", "save", "delete"):
                 out.add(node.func.value.id)
         if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             out.add(node.target.id)
@@ -247,7 +261,7 @@ def unify(a, b, name):
     if a == b:
         return a
     if isinstance(a, PyT) and isinstance(b, PyT):
-        return PyT(None)
+        return PyT(a.kind if a.kind == b.kind else None, a.tainted or b.tainted)
     # `x = None` then `x = Model.objects.first()`: an Option<Model> variable.
     if isinstance(a, RowT) and b == PyT("none"):
         return a
@@ -269,7 +283,11 @@ def var_rust_type(t, tr):
         return "Option<DrfResponse>", "None"
     if t == DATETIME:
         return "DateTime<Utc>", "DateTime::<Utc>::MIN_UTC"
-    if t in (OPAQUE, USER, DATA, QUERY):
+    if t == UUID:
+        return "DjUuid", "DjUuid(djrs_runtime::uuid::Uuid::nil())"
+    if t == DATE:
+        return "chrono::NaiveDate", "chrono::NaiveDate::MIN"
+    if t in (OPAQUE, USER, DATA, QUERY, REQUEST, SER_SELF):
         return None, None  # no Rust variable: an alias, or never read
     raise Unsupported("a variable holding a %s" % (getattr(t, "name", None) or type(t).__name__))
 
@@ -368,21 +386,26 @@ TIMEDELTA_UNITS = {
 }  # fmt: skip
 
 
-def parse_function(view):
-    fn_ir = view.get("function") or {}
-    src = fn_ir.get("source")
+def parse_source(src, what="view"):
     if not src:
-        raise Unsupported("view source not found")
+        raise Unsupported("%s source not found" % what)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # e.g. invalid escapes in the project's strings
             tree = ast.parse(textwrap.dedent(src))
     except SyntaxError:
-        raise Unsupported("view source doesn't parse with this Python")
+        raise Unsupported("%s source doesn't parse with this Python" % what)
     fns = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     if len(fns) != 1:
-        raise Unsupported("view source isn't one function")
-    fn = fns[0]
+        raise Unsupported("%s source isn't one function" % what)
+    if isinstance(fns[0], ast.AsyncFunctionDef):
+        raise Unsupported("async %s" % what)
+    return fns[0]
+
+
+def parse_function(view):
+    fn_ir = view.get("function") or {}
+    fn = parse_source(fn_ir.get("source"))
     if isinstance(fn, ast.AsyncFunctionDef) or fn_ir.get("is_async"):
         raise Unsupported("async views")
     if fn_ir.get("decorators"):
@@ -391,7 +414,7 @@ def parse_function(view):
 
 
 class FnLower:
-    def __init__(self, tr, view, fn, var_types, learning):
+    def __init__(self, tr, view, fn, var_types, learning, parent=None, iid=None):
         self.tr = tr
         self.view = view
         self.fn = fn
@@ -399,7 +422,15 @@ class FnLower:
         self.var_types = var_types
         self.learning = learning
         self.out = Out(1)
-        self.n = 0
+        self.parent = parent
+        self.iid = iid  # set for an inlined project function
+        self.counter = parent.counter if parent else [0]
+        self.inline_stack = (parent.inline_stack if parent else ()) + ((view["function"].get("path"),) if parent else ())
+        self.broad_try = parent.broad_try if parent else 0
+        self.ret_type = None
+        self.request = None
+        if parent is None and iid:
+            self.inlines = iid  # labels of functions inlined here come after this one
         self.assigned = set()
         self.deleted = set()
         self.catch = []  # stack of (labels or None for any model, handler statements)
@@ -411,8 +442,8 @@ class FnLower:
     # ---- small helpers ---------------------------------------------------------
 
     def tmp(self, prefix="t"):
-        self.n += 1
-        return "%s_%d" % (prefix, self.n)
+        self.counter[0] += 1
+        return "%s_%d" % (prefix, self.counter[0])
 
     def let(self, expr, t=None, prefix="t"):
         name = self.tmp(prefix)
@@ -444,6 +475,8 @@ class FnLower:
         in place isn't also stored somewhere else (except in what is returned)."""
         name = getattr(v, "var", None)
         if name in self.mutated and not self.in_return and not self._immutable(name):
+            if isinstance(v.t, RowT):
+                raise Unsupported("a model instance changed in place is also stored elsewhere")
             raise Unsupported("a list or dict changed in place is also stored elsewhere")
         return own(v)
 
@@ -451,15 +484,29 @@ class FnLower:
         t = self.var_types.get(name)
         return isinstance(t, PyT) and t.kind in IMMUTABLE
 
-    def need_py(self, v, what="value"):
+    def need_py(self, v, what="value", inspect=True):
+        """`v` as a Py value. With inspect=False the value is only stored or
+        returned (a UUID becomes its string, marked tainted); otherwise it is
+        looked at, which a tainted value can't be."""
+        if v.t == UUID and not inspect:
+            return V(PyT("str", tainted=True), "Py::Str(%s.hyphenated())" % v.r)
+        if v.t == DATE and not inspect:
+            # DRF's encoder renders a date as isoformat(); Python keeps the date object.
+            return V(PyT("str", tainted=True), 'Py::Str(%s.format("%%Y-%%m-%%d").to_string())' % v.r)
         if not isinstance(v.t, PyT):
             raise Unsupported("%s of kind %s used as a plain Python value" % (what, _tname(v.t)))
+        if inspect and v.t.tainted:
+            raise Unsupported("looking inside a value that holds UUID objects")
         return v
+
+    def store(self, v, what="value"):
+        """need_py for values that are only stored or returned."""
+        return self.need_py(v, what, inspect=False)
 
     def var(self, name):
         if not name.isidentifier() or not name.isascii():
             raise Unsupported("non-ASCII variable names")
-        return "v_" + name
+        return ("v%d_" % self.iid if self.iid else "v_") + name
 
     # ---- the function ----------------------------------------------------------
 
@@ -511,7 +558,7 @@ class FnLower:
             if rt is not None:
                 lines.append("    let mut %s: %s = %s;" % (self.var(name), rt, init))
             if isinstance(t, QsT):
-                lines.append("    let mut o_%s: orm::Ordering = None;" % name)
+                lines.append("    let mut o%s_%s: orm::Ordering = None;" % (self.iid or "", name))
         return lines
 
     def _set_type(self, name, t):
@@ -547,6 +594,8 @@ class FnLower:
         return False
 
     def s_Return(self, s):
+        if self.iid:
+            return self.inline_return(s.value)
         if s.value is None:
             raise Unsupported("view returns None")
         self.in_return = True
@@ -562,6 +611,8 @@ class FnLower:
     def s_Raise(self, s):
         if s.exc is None:
             raise Unsupported("bare raise")
+        if self.broad_try:
+            raise Unsupported("raise inside a try whose except clause catches it")
         v = self.expr(s.exc)
         if v.t != EXC:
             if isinstance(v.t, Named) and v.t.what == "exception class":
@@ -580,8 +631,20 @@ class FnLower:
         return False
 
     def check_fresh(self, name, node, v):
-        if name in self.mutated and not (isinstance(v.t, PyT) and v.t.kind in IMMUTABLE) and not fresh(node):
+        if name not in self.mutated or not isinstance(v.t, (PyT, RowT)):
+            return
+        if isinstance(v.t, RowT):
+            # A query result is a new object; anything else may be shared.
+            if not isinstance(node, (ast.Call, ast.Subscript)) or self._is_project_call(node):
+                raise Unsupported("a model instance changed in place may be shared with another variable")
+            return
+        if not (isinstance(v.t, PyT) and v.t.kind in IMMUTABLE) and not fresh(node):
             raise Unsupported("a list or dict changed in place starts as another object's alias")
+
+    def _is_project_call(self, node):
+        d = self._dotted(node.func) if isinstance(node, ast.Call) else None
+        r = self.refs.get(d) if d else None
+        return bool(r and r.get("kind") == "function" and r.get("project"))
 
     def s_AugAssign(self, s):
         if not isinstance(s.target, ast.Name):
@@ -626,6 +689,8 @@ class FnLower:
             self.out.open("for it in %s" % rows)
             self.out.line("%s = Some(it);" % self.var(name))
         elif isinstance(it.t, RowsT):
+            if name in self.mutated:
+                raise Unsupported("changing instances of a list while iterating it")
             self._set_type(name, RowT(it.t.label))
             self.out.open("for it in %s.clone()" % it.r)
             self.out.line("%s = Some(it);" % self.var(name))
@@ -659,6 +724,29 @@ class FnLower:
         self.out.line("continue;")
         return True
 
+    def s_With(self, s):
+        """`with transaction.atomic():`. Every error inside already forwards (all
+        rolled back), so the savepoint only matters for a native `raise`, which
+        is refused, and for an outer `except DoesNotExist`, which mustn't run
+        in Rust here (Django would roll the block back first)."""
+        if len(s.items) != 1 or s.items[0].optional_vars is not None:
+            raise Unsupported("with statements other than transaction.atomic()")
+        ctxe = s.items[0].context_expr
+        target = ctxe.func if isinstance(ctxe, ast.Call) else ctxe
+        if isinstance(ctxe, ast.Call) and (ctxe.args or ctxe.keywords):
+            raise Unsupported("transaction.atomic() with arguments")
+        d = self._dotted(target)
+        r = self.refs.get(d) if d else None
+        if not r or r.get("path") != "django.db.transaction.atomic":
+            raise Unsupported("with statements other than transaction.atomic()")
+        self.catch.append((set(), None))  # a barrier: nothing outside is caught in Rust
+        self.broad_try += 1
+        try:
+            return self.block(s.body)
+        finally:
+            self.broad_try -= 1
+            self.catch.pop()
+
     def s_Try(self, s):
         """Only `Model.DoesNotExist` from `.get()` is caught in Rust (its
         handler is inlined where it would be raised). Any other exception in
@@ -682,13 +770,13 @@ class FnLower:
             if other:
                 broad = True
                 break  # later clauses only see what this one doesn't catch: never DoesNotExist here
-        if broad and any(isinstance(n, ast.Raise) for b in s.body for n in ast.walk(b)):
-            raise Unsupported("raise inside a try whose except clause catches it")
         if frame is not None:
             self.catch.append(frame)
+        self.broad_try += 1 if broad else 0
         try:
             div = self.block(s.body)
         finally:
+            self.broad_try -= 1 if broad else 0
             if frame is not None:
                 self.catch.pop()
         if s.orelse and not div:
@@ -737,7 +825,10 @@ class FnLower:
             base = self.expr(target.value)
             self.need_py(base, "item assignment target")
             key = self.need_py(self.expr(_slice(target)))
-            self.out.line("ops::setitem(&mut %s, %s, %s)?;" % (base.r, ref(key), self.own(self.need_py(v))))
+            val = self.store(v)
+            if val.t.tainted and not self.var_types.get(target.value.id, PyT()).tainted:
+                self._set_type(target.value.id, PyT(None, True))
+            self.out.line("ops::setitem(&mut %s, %s, %s)?;" % (base.r, ref(key), self.own(val)))
             return
         raise Unsupported("assignment to %s" % type(target).__name__)
 
@@ -746,10 +837,10 @@ class FnLower:
             raise Unsupported("rebinding the name being iterated")
         t = self._set_type(name, v.t)
         var = self.var(name)
-        if v.t in (OPAQUE, USER, DATA, QUERY):
+        if v.t in (OPAQUE, USER, DATA, QUERY, REQUEST, SER_SELF):
             pass
         elif isinstance(t, PyT):
-            self.out.line("%s = %s;" % (var, self.own(self.need_py(v))))
+            self.out.line("%s = %s;" % (var, self.own(self.store(v))))
         elif isinstance(t, RowT):
             if isinstance(v.t, PyT):
                 self.out.line("%s = None;" % var)
@@ -757,8 +848,8 @@ class FnLower:
                 self.out.line("%s = %s;" % (var, self.own(v)))
         elif isinstance(t, QsT):
             self.out.line("%s = %s;" % (var, v.r))
-            self.out.line("o_%s = %s;" % (name, v.extra))
-        elif isinstance(t, RowsT) or t in (DATETIME,):
+            self.out.line("o%s_%s = %s;" % (self.iid or "", name, v.extra))
+        elif isinstance(t, RowsT) or t in (DATETIME, UUID, DATE):
             self.out.line("%s = %s;" % (var, v.r))
         elif t == RESPONSE:
             self.out.line("%s = Some(%s);" % (var, v.r))
@@ -802,16 +893,18 @@ class FnLower:
                 v.var = name
                 return v
             if isinstance(t, RowT):
-                return V(t, var, place=True, extra=name)
+                v = V(t, var, place=True, extra=name)
+                v.var = name
+                return v
             if isinstance(t, QsT):
-                return V(t, "%s.clone()" % var, extra="o_%s" % name)
+                return V(t, "%s.clone()" % var, extra="o%s_%s" % (self.iid or "", name))
             if isinstance(t, RowsT):
                 return V(t, "%s.clone()" % var)
             if t == RESPONSE:
                 return V(t, '%s.clone().expect("assigned")' % var)
-            if t == DATETIME:
+            if t in (DATETIME, UUID, DATE):
                 return V(t, var)
-            if t in (USER, DATA, QUERY):
+            if t in (USER, DATA, QUERY, REQUEST, SER_SELF):
                 return V(t)
             raise Unsupported("variable %s holds a %s" % (name, _tname(t)))
         return self.ref_value(name)
@@ -835,6 +928,9 @@ class FnLower:
             value = r.get("value")
             if isinstance(value, dict) and value == {"$none": True}:
                 value = None
+            if isinstance(value, list) and all(py_kind(x) is not None for x in value):
+                # Recorded as a list; it may have been a tuple, so only list/tuple-neutral uses.
+                return V(PyT("seq"), "Py::List(vec![%s])" % ", ".join(py_lit(x) for x in value))
             if py_kind(value) is None:
                 raise Unsupported("constant %s of an unsupported type" % dotted)
             return V(PyT(py_kind(value)), py_lit(value), const=value)
@@ -868,16 +964,26 @@ class FnLower:
                 return V(DoesNotExistT(None))
             if path == "datetime.timedelta":
                 return V(TIMEDELTA_CLS)
+            if path == "uuid.UUID":
+                return V(UUID_CLS)
             mro = r.get("mro") or []
             if "rest_framework.serializers.BaseSerializer" in mro:
                 return V(SerClsT(path))
             raise Unsupported("uses class %s" % path)
+        if kind == "function" and dotted.endswith(".strptime"):
+            base = self.refs.get(dotted.rsplit(".", 1)[0]) or {}
+            if base.get("kind") == "class" and base.get("path") == "datetime.datetime":
+                return V(STRPTIME)
         if kind == "function":
             path = r.get("path")
             if path == "django.utils.timezone.now":
                 return V(NOW_FN)
+            if path == "uuid.uuid4":
+                return V(UUID4_FN)
+            if r.get("project") and path in (self.tr.data.get("functions") or {}):
+                return V(Named("project function", path))
             if r.get("project"):
-                raise Unsupported("calls a project function (not translated yet)")
+                raise Unsupported("calls a project function djrs couldn't read")
             raise Unsupported("calls %s" % path)
         if kind == "celery_task":
             raise Unsupported("queues a Celery task")
@@ -918,6 +1024,8 @@ class FnLower:
             raise Unsupported("request.user.%s" % name)
         if t == DATA:
             raise Unsupported("request.data.%s" % name)
+        if t == SER_SELF:
+            raise Unsupported("self.%s in a serializer method" % name)
         if isinstance(t, RowT):
             return self.read_field(base, name)
         if isinstance(t, SerT):
@@ -944,6 +1052,20 @@ class FnLower:
             "float": "Py::Float(x)",
             "json": "x.0.clone()",
         }.get(f.kind)
+        if f.kind == "date":
+            if f.null:
+                raise Unsupported("reading a nullable date field")
+            return self.let(
+                "match &%s { Some(r) => r.%s, None => %s }" % (row.r, f.ident, self.fwd("attribute of None")),
+                DATE,
+            )
+        if f.kind == "uuid":
+            if f.null:
+                raise Unsupported("reading a nullable UUID field")
+            return self.let(
+                "match &%s { Some(r) => r.%s, None => %s }" % (row.r, f.ident, self.fwd("attribute of None")),
+                UUID,
+            )
         if f.kind == "datetime":
             if f.null:
                 raise Unsupported("reading a nullable datetime field")
@@ -1044,6 +1166,21 @@ class FnLower:
                 val = "orm::w_float(%s)?" % ref(v)
             elif f.kind == "json":
                 val = "{ let j = %s; if matches!(j, Py::None) { None } else { Some(DjJson(j)) } }" % self.own(v)
+            elif f.kind == "date":
+                if v.t == DATE:
+                    val = "Some(%s)" % v.r
+                elif v.const is None:
+                    val = "None"
+                else:
+                    raise Unsupported("assigning a non-date to a date field")
+            elif f.kind == "uuid":
+                if v.t == UUID:
+                    val = "Some(%s)" % v.r
+                elif v.const is None:
+                    val = "None"
+                else:
+                    # Python would keep the str in memory until it's reloaded.
+                    raise Unsupported("assigning a non-UUID value to a UUID field")
             elif f.kind == "datetime":
                 if v.t == DATETIME:
                     val = "Some(DjDateTime(%s))" % v.r
@@ -1092,6 +1229,8 @@ class FnLower:
                 return self._wrap_null(f, "DjJson(Py::List(Vec::new()))")
             if f.kind == "datetime" and c == "django.utils.timezone.now":
                 return self._wrap_null(f, "DjDateTime(now())")
+            if f.kind == "uuid" and c == "uuid.uuid4":
+                return self._wrap_null(f, "DjUuid::new_v4()")
             raise Unsupported("default %s of field %s" % (c, f.name))
         raise Unsupported("default of field %s" % f.name)
 
@@ -1136,7 +1275,7 @@ class FnLower:
             return "true"
         if t == QUERY:
             return "!ctx.query.is_empty()"
-        if t == DATETIME:
+        if t in (DATETIME, UUID, DATE):
             return "true"
         raise Unsupported("truthiness of a %s" % _tname(t))
 
@@ -1167,27 +1306,44 @@ class FnLower:
                 c = "matches!(%s, Py::None)" % a.r
             elif isinstance(a.t, RowT):
                 c = "%s.is_none()" % a.r
-            elif a.t in (USER, DATETIME):
+            elif a.t in (USER, DATETIME, UUID):
                 c = "false"
             else:
                 raise Unsupported("'is None' on a %s" % _tname(a.t))
             return "!(%s)" % c if neg else c
         if isinstance(op, (ast.In, ast.NotIn)):
             neg = "!" if isinstance(op, ast.NotIn) else ""
+            if b.t == DATA and not isinstance(a.const, str):
+                k = self.need_py(a)
+                return "%s%s" % (neg, self.let(
+                    "match %s { Py::Str(s) => ctx.data()?.contains(s)?, Py::List(_) | Py::Dict(_) => %s, other => ops::contains(&ctx.data()?.value()?, other)? }"
+                    % (ref(k), self.fwd("unhashable key in request.data")), PyT("bool")).r)
             if b.t in (DATA, QUERY):
                 if not isinstance(a.const, str):
-                    raise Unsupported("'in request.data' with a non-constant key")
+                    raise Unsupported("'in request.query_params' with a non-constant key")
                 if b.t == DATA:
                     return "%s%s" % (neg, self.let("ctx.data()?.contains(%s)?" % raw_str(a.const), PyT("bool")).r)
                 return "%sctx.query.contains(%s)" % (neg, raw_str(a.const))
             self.need_py(a)
             self.need_py(b)
             return "%sops::contains(%s, %s)?" % (neg, ref(b), ref(a))
+        if isinstance(op, (ast.Eq, ast.NotEq)) and (isinstance(a.t, RowT) or isinstance(b.t, RowT)):
+            return self.model_eq(a, b, isinstance(op, ast.NotEq))
+        if UUID in (a.t, b.t) and isinstance(op, (ast.Eq, ast.NotEq)):
+            neg = isinstance(op, ast.NotEq)
+            if a.t == UUID and b.t == UUID:
+                return "(%s %s %s)" % (a.r, "!=" if neg else "==", b.r)
+            other = b if a.t == UUID else a
+            self.need_py(other)
+            # UUID.__eq__ returns NotImplemented for anything but a UUID: never equal.
+            return "true" if neg else "false"
         if a.t == DATETIME and b.t == DATETIME:
             sym = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">="}[type(op)]
             return "(%s %s %s)" % (a.r, sym, b.r)
         self.need_py(a)
         self.need_py(b)
+        if "seq" in (a.t.kind, b.t.kind):
+            raise Unsupported("comparing a constant that may be a tuple")
         if isinstance(op, ast.Eq):
             return "ops::eq(%s, %s)" % (ref(a), ref(b))
         if isinstance(op, ast.NotEq):
@@ -1197,22 +1353,48 @@ class FnLower:
             raise Unsupported("comparison %s" % type(op).__name__)
         return "ops::cmp(%s, %s, ops::Cmp::%s)?" % (ref(a), ref(b), cmp)
 
+    def model_eq(self, a, b, neg):
+        """`Model.__eq__`: both instances of the same concrete model with equal
+        pks; anything that isn't a model (or AnonymousUser) is never equal."""
+        if not isinstance(a.t, RowT):
+            a, b = b, a
+        m = self.model(a.t.label)
+        if b.t == USER:
+            if a.t.label != self.tr.schema.user_model or self.tr.user_pk_kind != "int":
+                c = "false"
+            else:
+                c = "match (&%s, &ctx.user) { (Some(r), Some(u)) => ops::eq(&Py::from(r.%s.clone()), &u.pk), _ => false }" % (
+                    a.r, m.pk.ident)
+        elif isinstance(b.t, RowT):
+            if self.model(b.t.label).raw.get("concrete_model") != m.raw.get("concrete_model"):
+                c = "false"
+            else:
+                c = "match (&%s, &%s) { (Some(x), Some(y)) => x.%s == y.%s, (None, None) => true, _ => false }" % (
+                    a.r, b.r, m.pk.ident, m.pk.ident)
+        elif isinstance(b.t, PyT) and b.const is None:
+            c = "%s.is_none()" % a.r
+        else:
+            raise Unsupported("comparing a model instance with a %s" % _tname(b.t))
+        return "!(%s)" % c if neg else c
+
     def e_Compare(self, n):
         return self.let("Py::Bool(%s)" % self.compare(n), PyT("bool"))
 
     def e_BoolOp(self, n):
         # `a or b` is a if a is truthy, else b (b evaluated only then).
-        first = self.py(n.values[0])
+        first = self.store(self.expr(n.values[0]))
+        tainted = first.t.tainted
         acc = self.let(self.own(first))
         for v in n.values[1:]:
             saved = self.capture()
-            nxt = self.py(v)
+            nxt = self.store(self.expr(v))
+            tainted |= nxt.t.tainted
             rhs = self.block_expr(saved, self.own(nxt))
             if isinstance(n.op, ast.Or):
                 expr = "if %s.truthy() { %s } else { %s }" % (acc.r, acc.r, rhs)
             else:
                 expr = "if %s.truthy() { %s } else { %s }" % (acc.r, rhs, acc.r)
-            acc = self.let(expr)
+            acc = self.let(expr, PyT(None, tainted))
         return acc
 
     def e_UnaryOp(self, n):
@@ -1239,6 +1421,8 @@ class FnLower:
             )
         self.need_py(a)
         self.need_py(b)
+        if "seq" in (a.t.kind, b.t.kind):
+            raise Unsupported("arithmetic on a constant that may be a tuple")
         fn = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul"}.get(type(op))
         if fn is None:
             raise Unsupported("operator %s" % type(op).__name__)
@@ -1248,34 +1432,36 @@ class FnLower:
     def e_IfExp(self, n):
         c = self.cond(n.test)
         saved = self.capture()
-        a = self.py(n.body)
+        a = self.store(self.expr(n.body))
         a_expr = self.block_expr(saved, self.own(a))
         saved = self.capture()
-        b = self.py(n.orelse)
+        b = self.store(self.expr(n.orelse))
         b_expr = self.block_expr(saved, self.own(b))
-        return self.let("if %s { %s } else { %s }" % (c, a_expr, b_expr))
+        return self.let("if %s { %s } else { %s }" % (c, a_expr, b_expr), PyT(None, a.t.tainted or b.t.tainted))
 
     def e_Dict(self, n):
+        tainted = False
         if any(k is None for k in n.keys):
             d = self.tmp("d")
             self.out.line("let mut %s = Py::dict();" % d)
             for k, v in zip(n.keys, n.values):
                 if k is None:
-                    other = self.py(v)
+                    other = self.store(self.expr(v))
+                    tainted |= other.t.tainted
                     self.out.line("ops::dict_update(&mut %s, %s)?;" % (d, ref(other)))
                 else:
                     kv = self.py(k)
-                    vv = self.py(v)
+                    vv = self.store(self.expr(v))
+                    tainted |= vv.t.tainted
                     self.out.line("ops::setitem(&mut %s, %s, %s)?;" % (d, ref(kv), self.own(vv)))
-            return V(PyT("dict"), d, place=True)
+            return V(PyT("dict", tainted), d, place=True)
         items = []
         for k, v in zip(n.keys, n.values):
-            if k is None:
-                raise Unsupported("** in a dict display")
             kv = self.py(k)
-            vv = self.py(v)
+            vv = self.store(self.expr(v))
+            tainted |= vv.t.tainted
             items.append("(%s, %s)" % (self.own(kv), self.own(vv)))
-        return self.let("ops::dict(vec![%s])?" % ", ".join(items), PyT("dict"))
+        return self.let("ops::dict(vec![%s])?" % ", ".join(items), PyT("dict", tainted))
 
     def e_ListComp(self, n):
         return self.comprehension(n, "list")
@@ -1315,10 +1501,13 @@ class FnLower:
                 self.out.open("if %s" % self.cond(c))
                 opened += 1
             if kind == "list":
-                self.out.line("%s.push(%s);" % (out, self.own(self.py(n.elt))))
+                e = self.store(self.expr(n.elt))
+                tainted = e.t.tainted
+                self.out.line("%s.push(%s);" % (out, self.own(e)))
             else:
                 k = self.py(n.key)
-                v = self.py(n.value)
+                v = self.store(self.expr(n.value))
+                tainted = v.t.tainted
                 self.out.line("%s.push((%s, %s));" % (out, self.own(k), self.own(v)))
             for _ in range(opened):
                 self.out.close()
@@ -1329,17 +1518,18 @@ class FnLower:
             else:
                 self.var_types[name] = old
         if kind == "list":
-            return self.let("Py::List(%s)" % out, PyT("list"))
-        return self.let("ops::dict(%s)?" % out, PyT("dict"))
+            return self.let("Py::List(%s)" % out, PyT("list", tainted))
+        return self.let("ops::dict(%s)?" % out, PyT("dict", tainted))
 
     def e_List(self, n):
-        items = [self.own(self.py(e)) for e in n.elts]
-        return self.let("Py::List(vec![%s])" % ", ".join(items), PyT("list"))
+        vs = [self.store(self.expr(e)) for e in n.elts]
+        tainted = any(v.t.tainted for v in vs)
+        return self.let("Py::List(vec![%s])" % ", ".join(self.own(v) for v in vs), PyT("list", tainted))
 
     def e_Tuple(self, n):
         # A tuple is only ever rendered as JSON here (a list); any other use differs from a list.
         v = self.e_List(n)
-        v.t = PyT("tuple")
+        v.t = PyT("tuple", v.t.tainted)
         return v
 
     def e_JoinedStr(self, n):
@@ -1350,8 +1540,13 @@ class FnLower:
             elif isinstance(part, ast.FormattedValue):
                 if part.format_spec is not None or part.conversion not in (-1, 115):
                     raise Unsupported("f-string format specs or !r")
-                v = self.py(part.value)
-                t = self.let("ops::str_string(%s)?" % ref(v))
+                v = self.expr(part.value)
+                if v.t == UUID:
+                    t = self.let("%s.hyphenated()" % v.r)
+                elif v.t == DATE:
+                    t = self.let('%s.format("%%Y-%%m-%%d").to_string()' % v.r)
+                else:
+                    t = self.let("ops::str_string(%s)?" % ref(self.need_py(v)))
                 pieces.append("s.push_str(&%s);" % t.r)
             else:
                 raise Unsupported("f-string part")
@@ -1370,8 +1565,10 @@ class FnLower:
             raise Unsupported("slicing a plain value")
         if base.t in (DATA, QUERY):
             key = self.expr(sl)
+            if not isinstance(key.const, str) and base.t == DATA:
+                return self.let("ctx.data()?.getitem_py(%s)?" % ref(self.need_py(key)))
             if not isinstance(key.const, str):
-                raise Unsupported("request.data[...] with a non-constant key")
+                raise Unsupported("request.GET[...] with a non-constant key")
             if base.t == DATA:
                 return self.let("ctx.data()?.getitem(%s)?" % raw_str(key.const))
             return self.let(
@@ -1418,10 +1615,26 @@ class FnLower:
             return self.exception(t.name, pos, kw)
         if isinstance(t, Named) and t.what == "builtin":
             return self.builtin(t.name, n)
+        if isinstance(t, Named) and t.what == "project function":
+            return self.inline(t.name, n)
         if t == NOW_FN:
             if n.args or n.keywords:
                 raise Unsupported("timezone.now() with arguments")
             return self.let("now()", DATETIME)
+        if t == STRPTIME:
+            pos, kw = self.args(n)
+            if kw or len(pos) != 2 or pos[1].const != "%Y-%m-%d":
+                raise Unsupported("datetime.strptime() with a format other than %Y-%m-%d")
+            return self.let("ops::strptime_ymd(%s)?" % ref(self.need_py(pos[0])), NAIVE_DT)
+        if t == UUID4_FN:
+            if n.args or n.keywords:
+                raise Unsupported("uuid4() with arguments")
+            return self.let("DjUuid::new_v4()", UUID)
+        if t == UUID_CLS:
+            pos, kw = self.args(n)
+            if kw or len(pos) != 1:
+                raise Unsupported("uuid.UUID() with keyword arguments")
+            return self.let("orm::uuid_call(%s)?" % ref(self.need_py(pos[0])), UUID)
         if t == TIMEDELTA_CLS:
             if n.args:
                 raise Unsupported("timedelta() with positional arguments")
@@ -1445,6 +1658,10 @@ class FnLower:
             raise Unsupported("%s() with these arguments" % name)
         (x,) = pos
         if name == "str":
+            if x.t == UUID:
+                return self.let("Py::Str(%s.hyphenated())" % x.r, PyT("str"))
+            if x.t == DATE:
+                return self.let('Py::Str(%s.format("%%Y-%%m-%%d").to_string())' % x.r, PyT("str"))
             return self.let("ops::str_(%s)?" % ref(self.need_py(x)), PyT("str"))
         if name == "int":
             return self.let("ops::int_(%s)?" % ref(self.need_py(x)), PyT("int"))
@@ -1482,6 +1699,136 @@ class FnLower:
             alts.append(pats[v.t.name])
         return self.let("Py::Bool(matches!(%s, %s))" % (x.r, " | ".join(alts)), PyT("bool"))
 
+    # ---- project functions, inlined -------------------------------------------------
+
+    def inline(self, path, n):
+        """A call to one of the project's functions, translated in place: its
+        body runs in its own variable scope inside a labeled Rust block, and
+        `return x` becomes `break 'label x`."""
+        fn_ir = self.tr.data["functions"][path]
+        if fn_ir.get("is_async") or fn_ir.get("decorators"):
+            raise Unsupported("calls a decorated or async project function")
+        if path in self.inline_stack or len(self.inline_stack) >= 3:
+            raise Unsupported("project functions nested too deeply or recursive")
+        fn = parse_source(fn_ir.get("source"), "project function")
+        if fn.decorator_list:
+            raise Unsupported("calls a decorated project function")
+        a = fn.args
+        if a.vararg or a.kwarg or a.kwonlyargs or getattr(a, "posonlyargs", None):
+            raise Unsupported("project function with *args/**kwargs")
+        pos, kw = self.args(n)
+        params = [p.arg for p in a.args]
+        if len(pos) > len(params):
+            raise Unsupported("too many arguments to a project function")
+        bound = dict(zip(params, pos))
+        for k, v in kw.items():
+            if k not in params or k in bound:
+                raise Unsupported("bad keyword argument to a project function")
+            bound[k] = v
+        defaults = dict(zip(params[len(params) - len(a.defaults):], a.defaults))
+        view = {"function": fn_ir}
+        root = self
+        while root.parent:
+            root = root.parent
+        root.inlines = getattr(root, "inlines", 0) + 1
+        iid = root.inlines
+        # Arguments are evaluated here, in the caller: passing a value that is
+        # changed in place elsewhere would share it, so own() checks that.
+        args = {}
+        for p in params:
+            if p in bound:
+                v = bound[p]
+                if isinstance(v.t, (PyT,)) or v.t == UUID:
+                    v = self.store(v)
+                    args[p] = (v.t, self.own(v) if v.t != UUID else v.r)
+                elif isinstance(v.t, RowT):
+                    args[p] = (v.t, self.own(v))
+                elif isinstance(v.t, QsT):
+                    args[p] = (v.t, (v.r, v.extra))
+                elif v.t in (USER, DATA, QUERY, REQUEST, DATETIME, SER_SELF):
+                    args[p] = (v.t, v.r)
+                else:
+                    raise Unsupported("passing a %s to a project function" % _tname(v.t))
+            elif p in defaults:
+                d = defaults[p]
+                probe = FnLower(self.tr, view, fn, {}, True, parent=self, iid=iid)
+                dv = probe.expr(d)
+                if dv.const is NOCONST:
+                    raise Unsupported("non-constant default in a project function")
+                args[p] = (dv.t, dv.r)
+            else:
+                raise Unsupported("missing argument to a project function")
+        # Pass 1 learns the function's variable types and return type.
+        learn = FnLower(self.tr, view, fn, {}, True, parent=self, iid=iid)
+        learn.out = Out(self.out.indent + 1)
+        saved_counter = self.counter[0]
+        learn.run_inline(args)
+        self.counter[0] = saved_counter
+        real = FnLower(self.tr, view, fn, learn.var_types, False, parent=self, iid=iid)
+        real.ret_type = learn.ret_type
+        real.out = Out(self.out.indent + 1)
+        body = real.run_inline(args)
+        rt = real.ret_type
+        label = "'inl_%d" % iid
+        t = self.tmp()
+        self.out.line("let %s = %s: {" % (t, label))
+        self.out.lines.extend(real.declarations_at(self.out.indent + 1))
+        self.out.lines.extend(body)
+        self.out.line("};")
+        if rt is None:
+            return V(PyT("none"), t, place=True, const=NOCONST)
+        if isinstance(rt, PyT):
+            return V(rt, t, place=True)
+        if isinstance(rt, RowT):
+            v = V(rt, t, place=True)
+            return v
+        return V(rt, t)
+
+    def run_inline(self, args):
+        for name, (t, expr) in args.items():
+            if name in self.mutated and (isinstance(t, RowT) or (isinstance(t, PyT) and t.kind not in IMMUTABLE)):
+                raise Unsupported("a project function changes its argument in place")
+            self._set_type(name, t)
+            if isinstance(t, QsT):
+                self.out.line("%s = %s;" % (self.var(name), expr[0]))
+                self.out.line("o%d_%s = %s;" % (self.iid, name, expr[1]))
+            elif var_rust_type(t, self.tr)[0] is not None:
+                self.out.line("%s = %s;" % (self.var(name), expr))
+            self.assigned.add(name)
+        if not self.block(self.fn.body):
+            self.inline_return(None)
+        return self.out.lines
+
+    def inline_return(self, node):
+        if node is None:
+            v = V(PyT("none"), "Py::None", const=None)
+        else:
+            self.in_return = True
+            try:
+                v = self.expr(node)
+            finally:
+                self.in_return = False
+        if v.t == UUID:
+            raise Unsupported("a project function returning a UUID")
+        t = v.t
+        if self.learning:
+            self.ret_type = unify(self.ret_type, t, "the function's return value")
+        rt = self.ret_type
+        if t == RESPONSE and rt == RESPONSE:
+            expr = v.r
+        elif isinstance(rt, PyT):
+            expr = self.own(self.store(v))
+        elif isinstance(rt, RowT):
+            expr = "None" if isinstance(t, PyT) else self.own(v)
+        else:
+            raise Unsupported("a project function returning a %s" % _tname(t))
+        self.out.line("break 'inl_%d %s;" % (self.iid, expr))
+        return True
+
+    def declarations_at(self, indent):
+        pad = "    " * indent
+        return [pad + l.strip() for l in self.declarations()]
+
     def response(self, pos, kw):
         names = ["data", "status"]
         args = dict(zip(names, pos))
@@ -1491,20 +1838,22 @@ class FnLower:
             if k not in names or k in args:
                 raise Unsupported("Response(%s=...)" % k)
             args[k] = v
-        status = 200
+        status = ".with_status(200)"
         if "status" in args:
             s = args["status"]
             if s.const is None:
-                status = 200
+                pass
             elif type(s.const) is int and 100 <= s.const <= 599:
-                status = s.const
+                status = ".with_status(%d)" % s.const
+            elif s.const is NOCONST:
+                status = ".with_status_py(%s)?" % ref(self.need_py(s))
             else:
-                raise Unsupported("Response status that isn't a constant")
+                raise Unsupported("Response status that isn't a valid code")
         data = args.get("data")
         if data is None or data.const is None:
-            return V(RESPONSE, "DrfResponse::empty(%d)" % status)
-        self.need_py(data, "Response data")
-        return V(RESPONSE, "DrfResponse::data(%s).with_status(%d)" % (self.own(data), status))
+            return V(RESPONSE, "DrfResponse::empty(200)%s" % status)
+        data = self.store(data, "Response data")
+        return V(RESPONSE, "DrfResponse::data(%s)%s" % (self.own(data), status))
 
     def exception(self, name, pos, kw):
         detail = pos[0] if pos else kw.pop("detail", None)
@@ -1526,6 +1875,13 @@ class FnLower:
         return V(EXC, "ApiError::raised(%d, %s, %s)" % (m["status"], d, raw_str(m["detail"])))
 
     def serializer(self, path, n):
+        # `context=` is only read by fields we don't translate. Python still
+        # evaluates it, so it is skipped only when that can't fail or change anything.
+        ctx_node = next((k.value for k in n.keywords if k.arg == "context"), None)
+        if ctx_node is not None:
+            if not self._harmless(ctx_node):
+                self.expr(ctx_node)
+            n = ast.Call(func=n.func, args=n.args, keywords=[k for k in n.keywords if k.arg != "context"])
         pos, kw = self.args(n)
         if len(pos) > 1:
             raise Unsupported("serializer with data")
@@ -1554,17 +1910,35 @@ class FnLower:
                 rows = inst.r
             else:
                 raise Unsupported("serializer many=True over a %s" % _tname(inst.t))
-            expr = "Py::List(%s.iter().map(%s).collect::<Result<Vec<_>, _>>()?)" % (rows, fn)
+            expr = "{ let mut out = Vec::new(); for r in %s.iter() { out.push(%s(ctx, r).await?); } Py::List(out) }" % (rows, fn)
         else:
             if not isinstance(inst.t, RowT) or inst.t.label != label:
                 raise Unsupported("serializer over a %s" % _tname(inst.t))
-            expr = "match &%s { Some(r) => %s(r)?, None => %s }" % (
+            expr = "match &%s { Some(r) => %s(ctx, r).await?, None => %s }" % (
                 inst.r, fn, self.fwd("serializer of None returns initial data"))
 
+        tainted = self.tr.serializers.tainted.get(path, False)
+
         def data():
-            return self.let(expr, PyT("dict" if not many else "list"))
+            return self.let(expr, PyT("dict" if not many else "list", tainted))
 
         return V(SerT(path, many), extra=data)
+
+    def _harmless(self, node):
+        """Expressions whose evaluation can't raise or have effects."""
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self.assigned or (node.id not in self.locals and node.id in self.refs)
+        if isinstance(node, ast.Attribute):
+            return self._dotted(node) in ("%s.user" % self.request, "%s.data" % self.request) or (
+                isinstance(node.value, ast.Name) and node.value.id == self.request and node.attr == "user"
+            )
+        if isinstance(node, ast.Dict):
+            return all(k is not None and self._harmless(k) and self._harmless(v) for k, v in zip(node.keys, node.values))
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return all(self._harmless(e) for e in node.elts)
+        return False
 
     # ---- methods -------------------------------------------------------------------
 
@@ -1572,6 +1946,8 @@ class FnLower:
         t = base.t
         if isinstance(t, (ManagerT, QsT)):
             return self.qs_method(base, name, n)
+        if t == NAIVE_DT and name == "date" and not n.args and not n.keywords:
+            return V(DATE, base.r)
         if isinstance(t, RowT):
             return self.row_method(base, name, n)
         if t in (DATA, QUERY):
@@ -1592,8 +1968,26 @@ class FnLower:
                 raise Unsupported(".append() on a temporary or with these arguments")
             if target in self.iterating:
                 raise Unsupported("appending to the list being iterated")
-            self.out.line("ops::append(&mut %s, %s)?;" % (self.var(target), self.own(self.need_py(pos[0]))))
+            val = self.store(pos[0])
+            if val.t.tainted and not self.var_types.get(target, PyT()).tainted:
+                self._set_type(target, PyT(None, True))
+            self.out.line("ops::append(&mut %s, %s)?;" % (self.var(target), self.own(val)))
             return V(PyT("none"), "Py::None", const=None)
+        if isinstance(t, PyT) and name == "update":
+            pos, kw = self.args(n)
+            target = getattr(base, "var", None)
+            if kw or len(pos) != 1 or target is None or target in self.iterating:
+                raise Unsupported(".update() on a temporary or with these arguments")
+            other = self.store(pos[0])
+            if other.t.tainted and not self.var_types.get(target, PyT()).tainted:
+                self._set_type(target, PyT(None, True))
+            self.out.line("ops::dict_update(&mut %s, %s)?;" % (self.var(target), ref(other)))
+            return V(PyT("none"), "Py::None", const=None)
+        if isinstance(t, PyT) and name == "join":
+            pos, kw = self.args(n)
+            if kw or len(pos) != 1:
+                raise Unsupported(".join() arguments")
+            return self.let("ops::join(%s, %s)?" % (ref(base), ref(self.need_py(pos[0]))), PyT("str"))
         if isinstance(t, PyT) and name in ("strip", "lower", "upper"):
             if n.args or n.keywords:
                 raise Unsupported(".%s() with arguments" % name)
@@ -1791,6 +2185,8 @@ class FnLower:
 
     def find_handler(self, label):
         for labels, body in reversed(self.catch):
+            if body is None:
+                return None  # transaction.atomic(): leave it to Django
             if labels is None or label in labels:
                 return body
         return None
@@ -1850,6 +2246,10 @@ class FnLower:
             tf = next(x for x in target.fields if x.column == f.target_column)
             v = self.let("%s.as_ref().map(|r| r.%s.clone())" % (val.r, tf.ident), OPAQUE)
             return ("orm::exact(%s, %s.clone())" % (col, v.r), nullable)
+        if val.t == UUID:
+            if f.kind != "uuid" or lookup != "exact":
+                raise Unsupported("a UUID compared with a %s field (%s)" % (f.kind, lookup))
+            return ("orm::exact(%s, Some(%s))" % (col, val.r), nullable)
         if val.t == DATETIME:
             if f.kind != "datetime":
                 raise Unsupported("datetime compared with a %s field" % f.kind)
@@ -1864,7 +2264,7 @@ class FnLower:
         self.need_py(val, "lookup value")
         kind = f.kind
         if lookup == "in":
-            conv = {"int": "orm::py_int(x)", "str": "orm::py_char(x)", "bool": "orm::lk_bool(x)"}.get(kind)
+            conv = {"int": "orm::py_int(x)", "str": "orm::py_char(x)", "bool": "orm::lk_bool(x)", "uuid": "orm::lk_uuid(x)"}.get(kind)
             if conv is None:
                 raise Unsupported("__in on a %s field" % kind)
             v = self.let(
@@ -1874,7 +2274,7 @@ class FnLower:
             )
             return ("orm::is_in(%s, %s.clone())" % (col, v.r), nullable)
         if lookup == "exact":
-            conv = {"int": "orm::py_int", "str": "orm::py_char", "bool": "orm::lk_bool"}.get(kind)
+            conv = {"int": "orm::py_int", "str": "orm::py_char", "bool": "orm::lk_bool", "uuid": "orm::lk_uuid"}.get(kind)
             if conv is None:
                 raise Unsupported("exact lookup on a %s field with a plain value" % kind)
             v = self.let("%s(%s)?" % (conv, ref(val)), OPAQUE)
@@ -1922,8 +2322,9 @@ class FnLower:
                 given[f.ident] = None  # pre_save overwrites it
                 continue
             given[f.ident] = self.write_value(m, f, k.arg, v)
-        if m.pk.internal not in ("AutoField", "BigAutoField", "SmallAutoField"):
-            raise Unsupported("create() on a model whose key isn't auto-incremented")
+        auto = m.pk.internal in ("AutoField", "BigAutoField", "SmallAutoField")
+        if not auto and not (m.pk.kind == "uuid" and m.pk.default.get("$callable") == "uuid.uuid4"):
+            raise Unsupported("create() on a model whose key isn't auto-incremented or uuid4")
         values = {}
         for f in m.fields:
             if f.primary_key:
@@ -1934,8 +2335,13 @@ class FnLower:
                 t = self.tmp()
                 self.out.line("let %s: %s = %s;" % (t, f.rust_type, self.default_value(f)))
                 values[f.ident] = t
-        am = ", ".join(["%s: NotSet" % m.pk.ident] + ["%s: Set(%s.clone())" % (k, v) for k, v in values.items()])
-        pk = self.let("%s::Entity::insert(%s::ActiveModel { %s }).exec(ctx.tx()).await?.last_insert_id" % (m.entity, m.entity, am), OPAQUE)
+        if auto:
+            am = ", ".join(["%s: NotSet" % m.pk.ident] + ["%s: Set(%s.clone())" % (k, v) for k, v in values.items()])
+            pk = self.let("%s::Entity::insert(%s::ActiveModel { %s }).exec(ctx.tx()).await?.last_insert_id" % (m.entity, m.entity, am), OPAQUE)
+        else:
+            pk = self.let("DjUuid::new_v4()", OPAQUE)
+            am = ", ".join(["%s: Set(%s)" % (m.pk.ident, pk.r)] + ["%s: Set(%s.clone())" % (k, v) for k, v in values.items()])
+            self.out.line("%s::Entity::insert(%s::ActiveModel { %s }).exec_without_returning(ctx.tx()).await?;" % (m.entity, m.entity, am))
         fields = ", ".join(["%s: %s" % (m.pk.ident, pk.r)] + ["%s: %s" % (k, v) for k, v in values.items()])
         return self.let("Some(%s::Model { %s })" % (m.entity, fields), RowT(m.label))
 

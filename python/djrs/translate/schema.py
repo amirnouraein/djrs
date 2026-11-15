@@ -74,7 +74,9 @@ class Field:
                 return None, "relation target column not found"
             if tf.get("internal_type") in INT_TYPES:
                 return "int", None
-            return None, "relation to a non-integer key"
+            if tf.get("internal_type") == "UUIDField":
+                return "uuid", None
+            return None, "relation to a key of type %s" % tf.get("internal_type")
         t = self.internal
         if t in INT_TYPES:
             return "int", None
@@ -90,6 +92,8 @@ class Field:
             return "datetime", None
         if t == "DateField":
             return "date", None
+        if t == "UUIDField":
+            return "uuid", None
         return None, "%s fields" % t
 
     @property

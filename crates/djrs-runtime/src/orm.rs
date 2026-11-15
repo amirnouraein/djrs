@@ -188,6 +188,26 @@ pub fn lk_list(v: &Py) -> Result<Vec<Py>, Stop> {
     }
 }
 
+/// `UUIDField.get_prep_value`: a str is parsed like `uuid.UUID(hex=...)`;
+/// anything Django would reject (or parse differently) goes to Django.
+pub fn lk_uuid(v: &Py) -> Result<Option<crate::db::DjUuid>, Stop> {
+    match v {
+        Py::None => Ok(None),
+        Py::Str(s) => crate::db::DjUuid::parse(s)
+            .map(Some)
+            .ok_or(Stop::Forward("not a UUID Django parses the same way")),
+        _ => Err(Stop::Forward("UUID lookup with a non-string value")),
+    }
+}
+
+/// `uuid.UUID(s)` called in a view.
+pub fn uuid_call(v: &Py) -> Result<crate::db::DjUuid, Stop> {
+    match v {
+        Py::Str(s) => crate::db::DjUuid::parse(s).ok_or(Stop::Forward("uuid.UUID() raises")),
+        _ => Err(Stop::Forward("uuid.UUID() of a non-string")),
+    }
+}
+
 /// A pattern lookup's value: `str()` of it; None raises ("Cannot use None as a query value").
 pub fn lk_pattern(v: &Py) -> Result<String, Stop> {
     match py_char(v)? {

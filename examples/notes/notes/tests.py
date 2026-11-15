@@ -5,7 +5,7 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
-from .models import Note, Tag
+from .models import Note, Reminder, Tag
 
 
 class NotesApiTests(APITestCase):
@@ -330,3 +330,62 @@ class MoreViewsTests(APITestCase):
         carol = User.objects.create_user("carol", password="pw")
         self.client.force_authenticate(carol)
         self.assertEqual(self.client.get("/api/notes/stats").json(), {"top": None, "total": 0})
+
+
+class RemindersTests(APITestCase):
+    """UUID keys, dates, inlined helpers, atomic blocks, method fields, nested serializers."""
+
+    def setUp(self):
+        self.alice = User.objects.create_user("alice", password="pw-alice")
+        self.bob = User.objects.create_user("bob", password="pw-bob")
+        self.note = Note.objects.create(owner=self.alice, title="Trip")
+        self.client.force_authenticate(self.alice)
+
+    def test_add_and_get_reminder(self):
+        res = self.client.post("/api/notes/%d/reminders" % self.note.id, {"label": "pack", "due": "2026-3-1"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        body = res.json()
+        reminder = Reminder.objects.get()
+        self.assertEqual(body, {"id": str(reminder.id), "note": self.note.id, "label": "pack", "due": "2026-03-01", "shout": "PACK!"})
+        res = self.client.get("/api/reminders/get", {"id": str(reminder.id)})
+        self.assertEqual(res.json()["id"], str(reminder.id))
+        self.assertEqual(res.json()["same_as_query"], False)
+        self.assertEqual(res.json()["due"], "2026-03-01")
+        # Other spellings of the same UUID find it too.
+        res = self.client.get("/api/reminders/get", {"id": reminder.id.hex.upper()})
+        self.assertEqual(res.status_code, 200)
+
+    def test_reminder_dates(self):
+        url = "/api/notes/%d/reminders" % self.note.id
+        res = self.client.post(url, {"label": "x", "due": "2026-02-30"}, format="json")
+        self.assertEqual(res.json(), {"status": "error", "error": "due must be YYYY-MM-DD"})
+        res = self.client.post(url, {"label": "x", "due": "2026-01-311"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.client.post(url, {"label": "x"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.client.post(url, {"label": "", "due": "2026-01- 5"}, format="json")
+        self.assertEqual((res.status_code, res.json()["due"], res.json()["shout"]), (201, "2026-01-05", None))
+        self.assertEqual(Reminder.objects.count(), 1)
+
+    def test_reminders_of_other_users(self):
+        other = Note.objects.create(owner=self.bob, title="Bob's")
+        res = self.client.post("/api/notes/%d/reminders" % other.id, {"label": "x", "due": "2026-01-01"}, format="json")
+        self.assertEqual(res.status_code, 404)
+        r = Reminder.objects.create(note=other, label="b", due="2026-01-01")
+        res = self.client.get("/api/reminders/get", {"id": str(r.id)})
+        self.assertEqual(res.json(), {"status": "error", "error": "Reminder not found"})
+
+    def test_note_overview(self):
+        Reminder.objects.create(note=self.note, label="b", due="2026-05-01")
+        Reminder.objects.create(note=self.note, label="a", due="2026-05-01")
+        Reminder.objects.create(note=self.note, label="z", due="2026-01-01")
+        body = self.client.get("/api/notes/%d/overview" % self.note.id).json()
+        self.assertEqual(body["owner"], {"id": self.alice.id, "username": "alice"})
+        self.assertEqual([r["label"] for r in body["reminders"]], ["z", "a", "b"])
+        self.assertEqual(self.client.get("/api/notes/999/overview").status_code, 404)
+
+    def test_deleting_a_note_deletes_its_reminders(self):
+        Reminder.objects.create(note=self.note, label="b", due="2026-05-01")
+        res = self.client.post("/api/notes/delete", {"note_id": self.note.id}, format="json")
+        self.assertEqual(res.json(), {"status": "success"})
+        self.assertEqual(Reminder.objects.count(), 0)

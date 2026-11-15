@@ -23,6 +23,7 @@ pub use app::{App, Dispatcher, Handler, HandlerFuture, NativeRequest, Outcome, S
 pub use config::Config;
 // Re-exported for macros used by generated code.
 pub use indexmap;
+pub use uuid;
 
 async fn connect_db(app: &App) -> Option<db::Db> {
     let settings = app.settings?;

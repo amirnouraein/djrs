@@ -91,6 +91,7 @@ REFS = {
     "list": {"kind": "builtin", "name": "list"},
     "NotFound": {"kind": "class", "path": "rest_framework.exceptions.NotFound", "mro": []},
     "Exception": {"kind": "builtin", "name": "Exception"},
+    "label": {"kind": "function", "path": "demo.views.label", "project": True},
     "str": {"kind": "builtin", "name": "str"},
     "int": {"kind": "builtin", "name": "int"},
     "helper": {"kind": "function", "path": "demo.views.helper", "project": True},
@@ -129,6 +130,20 @@ def _ir(views):
         "signals": {},
         "classes": {SERIALIZER["path"]: SERIALIZER},
         "views": {},
+        "functions": {
+            "demo.views.helper": {
+                "path": "demo.views.helper",
+                "source": "def helper(message, code=400):\n    return Response({'error': message}, status=code)\n",
+                "refs": {"Response": REFS["Response"]},
+                "decorators": [],
+            },
+            "demo.views.label": {
+                "path": "demo.views.label",
+                "source": "def label(item):\n    if item.count:\n        return f'{item.name} x{item.count}'\n    return item.name\n",
+                "refs": {},
+                "decorators": [],
+            },
+        },
     }
     for name, src in views.items():
         out["views"]["demo.views." + name] = {
@@ -227,6 +242,21 @@ class AcceptsTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIn("e::auth_user::Entity::find()", src)
 
+    def test_project_functions_are_inlined(self):
+        src, why = run(
+            """
+            @api_view(["GET"])
+            def v(request):
+                item = Item.objects.filter(owner=request.user).first()
+                if not item:
+                    return helper("missing", code=404)
+                return Response({"label": label(item)})
+            """
+        )
+        self.assertIsNone(why)
+        self.assertIn("'inl_1: {", src)
+        self.assertIn("with_status_py(&v1_code)", src)
+
     def test_exclude_keeps_nulls(self):
         src, why = run(
             """
@@ -313,9 +343,9 @@ class RefusesTests(unittest.TestCase):
             """
             @api_view(["GET"])
             def v(request):
-                return Response(helper())
+                return helper()
             """,
-            "project function",
+            "missing argument",
         )
         self.check(
             """

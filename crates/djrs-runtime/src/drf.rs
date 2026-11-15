@@ -181,6 +181,15 @@ impl DrfResponse {
             data: if data == Py::None { None } else { Some(data) },
         }
     }
+    /// `Response(..., status=x)` with a status known only at run time: Django
+    /// takes an int from 100 to 599 (None keeps 200); anything else raises.
+    pub fn with_status_py(self, status: &Py) -> Result<DrfResponse, Stop> {
+        match status {
+            Py::None => Ok(self),
+            Py::Int(i) if (100..=599).contains(i) => Ok(self.with_status(*i as u16)),
+            _ => Err(Stop::Forward("invalid HTTP status")),
+        }
+    }
     pub fn with_status(mut self, status: u16) -> DrfResponse {
         self.status = status;
         self
@@ -214,6 +223,13 @@ impl Data {
     pub fn getitem(&self, key: &str) -> Result<Py, Stop> {
         self.get(key)?
             .ok_or(Stop::Forward("KeyError on request.data"))
+    }
+    /// `request.data[key]` with a key known only at run time.
+    pub fn getitem_py(&self, key: &Py) -> Result<Py, Stop> {
+        match key {
+            Py::Str(k) => self.getitem(k),
+            _ => Err(Stop::Forward("request.data[...] with a non-str key")),
+        }
     }
     /// `key in request.data`.
     pub fn contains(&self, key: &str) -> Result<bool, Stop> {

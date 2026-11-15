@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
 
@@ -22,3 +24,13 @@ class Note(models.Model):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+
+
+class Reminder(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    note = models.ForeignKey(Note, on_delete=models.CASCADE, related_name="reminders")
+    label = models.CharField(max_length=100)
+    due = models.DateField()
+
+    class Meta:
+        ordering = ["due", "label"]

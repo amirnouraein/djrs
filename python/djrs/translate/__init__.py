@@ -36,6 +36,7 @@ class Translator:
         self.data = data
         self.schema = Schema(data)
         self.serializers = Serializers(data, self.schema)
+        self.serializers.tr = self
         user = ((data.get("auth") or {}).get("user") or {})
         self.user_pk_kind = "int" if user.get("pk_type") in INT_TYPES else None
         self.del_fns = {}  # label -> (fn name, source, deps)
@@ -140,7 +141,7 @@ class Translator:
         src = (
             header
             + py
-            + "\n#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, unused_parens, unused_braces, clippy::all)]\n"
+            + "\n#[allow(unused_mut, unused_variables, unused_assignments, unreachable_code, unused_parens, unused_braces, unused_labels, clippy::all)]\n"
             + "async fn body_%s(ctx: &mut Ctx) -> Result<DrfResponse, Stop> {\n" % ident
             + "".join(l + "\n" for l in low.declarations())
             + "".join(l + "\n" for l in body)
@@ -173,16 +174,18 @@ def translate(data, only=None):
         result.handlers[view_id] = {m: "translated::%s" % name for m in methods}
         pieces.append(src)
         used |= u
-    # Helpers the translated views use (and the delete helpers those call).
-    dels = set()
-    todo = [label for kind, label in used if kind == "del"]
+    # Helpers the translated views use, and the helpers those use.
+    dels, sers = set(), set()
+    todo = list(used)
     while todo:
-        label = todo.pop()
-        if label in dels:
-            continue
-        dels.add(label)
-        todo.extend(tr.del_fns[label][2])
-    sers = sorted(path for kind, path in used if kind == "ser")
+        kind, key = todo.pop()
+        if kind == "del" and key not in dels:
+            dels.add(key)
+            todo.extend(("del", c) for c in tr.del_fns[key][2])
+        elif kind == "ser" and key not in sers:
+            sers.add(key)
+            todo.extend(tr.serializers.deps.get(key) or ())
+    sers = sorted(sers)
     helpers = [tr.serializers.generated[p][0] for p in sers] + [tr.del_fns[l][1] for l in sorted(dels)]
     result.source = (
         "//! Rust translations of the project's views. Each handler follows its\n"
@@ -190,7 +193,7 @@ def translate(data, only=None):
         "//! for hands the request to Django instead.\n"
         "#![allow(dead_code, non_snake_case, unused_imports)]\n\n"
         "use chrono::{DateTime, Utc};\n"
-        "use djrs_runtime::db::{now, DjDateTime, DjJson};\n"
+        "use djrs_runtime::db::{now, DjDateTime, DjJson, DjUuid};\n"
         "use djrs_runtime::drf::{ApiError, Ctx, DrfResponse, Stop};\n"
         "use djrs_runtime::py::Py;\n"
         "use djrs_runtime::{drf_handler, ops, orm};\n"
