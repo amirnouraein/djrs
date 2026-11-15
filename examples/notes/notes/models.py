@@ -1,0 +1,22 @@
+from django.conf import settings
+from django.db import models
+
+
+class Tag(models.Model):
+    name = models.CharField(max_length=50, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+
+class Note(models.Model):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notes")
+    title = models.CharField(max_length=200)
+    body = models.TextField(blank=True, default="")
+    pinned = models.BooleanField(default=False)
+    priority = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    tags = models.ManyToManyField(Tag, blank=True, related_name="notes")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]

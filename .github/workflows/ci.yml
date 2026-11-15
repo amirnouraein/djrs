@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo test --workspace
+
+  python-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover tests
+
+  # The sample project on a spread of Django / DRF / Python versions.
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.8", django: "3.0.*", drf: "3.11.*" }
+          - { python: "3.9", django: "3.2.*", drf: "3.14.*" }
+          - { python: "3.11", django: "4.2.*", drf: "3.15.*" }
+          - { python: "3.12", django: "5.2.*", drf: "3.16.*" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - name: Python ${{ matrix.python }} with Django ${{ matrix.django }}
+        run: |
+          uv venv --python ${{ matrix.python }} .venv
+          uv pip install --python .venv/bin/python "django==${{ matrix.django }}" "djangorestframework==${{ matrix.drf }}" -e .
+      - run: PYTHON=$PWD/.venv/bin/python scripts/e2e.sh

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "djrs"
+version = "0.1.0"
+description = "Deterministic Django-to-Rust (Axum + SeaORM) transpiler with a Django fallback proxy"
+readme = "README.md"
+# The extractor and the test hook run inside the target project's own
+# environment, so they must work on old Pythons too. Keep this package free of
+# syntax newer than 3.7 (no walrus, no match, no `X | Y` annotations).
+requires-python = ">=3.7"
+dependencies = []
+
+[project.scripts]
+djrs = "djrs.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
