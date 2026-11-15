@@ -19,7 +19,7 @@ particular project, and it is not tied to a Django, DRF or database version.
 | Rust binary: Django-order URL resolution, forwarding proxy, switches | Working |
 | Test hook (`djrs.testing`): a project's own tests run through the binary | Working, with a byte-for-byte comparison mode |
 | Runtime for Rust handlers: SeaORM entities, DRF request cycle, token / session / basic auth, Django's response headers | Working for DRF function views; proven with hand-written handlers on SQLite, MySQL and PostgreSQL |
-| Translating views to Rust automatically | Not started. Views without a Rust handler are forwarded, with the reason in `COVERAGE.md` |
+| Translator: DRF function views to Rust | Working for a growing subset (see below). Proven on the sample project on Django 3.0, 4.2 and 5.2, SQLite, MySQL and PostgreSQL; on the production project, 43 of 537 DRF function views translate and compile so far. Views outside the subset are forwarded, with the reason in `COVERAGE.md` |
 
 ## How it works
 
@@ -87,8 +87,30 @@ send real HTTP to the binary. Without `DJRS_BINARY` it is Django's normal runner
 ## Rust handlers
 
 A view is answered in Rust when the generated crate has a handler for it.
-Until the translator exists, handlers are hand-written and listed in the
-project's `djrs.toml` (see `examples/notes/djrs.toml`):
+`djrs generate` translates every DRF function view it can into
+`src/translated.rs` (each handler is preceded by its Python, and follows it
+line by line). The translator is rule-based: a view is translated only if
+everything in it is in the supported subset, and any operation Python would
+raise on hands the request to Django at run time. Supported so far:
+
+- `request.data`, `request.query_params` / `GET`, `request.user` (and its
+  fields), `request.method`, URL parameters
+- querysets: `filter` / `exclude` / `order_by` / slicing / `first` / `last` /
+  `get` / `count` / `exists` / `create` / `update` / `delete` (with Django's
+  cascades), lookups `exact`, `iexact`, `[i]contains`, `[i]startswith`,
+  `[i]endswith`, `in`, `gt(e)`, `lt(e)`, `isnull`, on local fields and
+  `fk__pk`; related objects (`note.owner`)
+- model instances: field reads and writes, `save()` (also `update_fields`),
+  `delete()`; `ModelSerializer(...).data` for plain field types
+- `Response`, DRF exceptions, `try/except Model.DoesNotExist` (other except
+  clauses are left to Django: any error in the body forwards)
+- Python: `if` / `for` / comprehensions, dict and list building, f-strings,
+  `str` / `int` / `bool` / `len` / `list` / `isinstance`, `strip` /
+  `lower` / `upper`, comparisons and arithmetic with Python's rules,
+  `timezone.now()` and `timedelta`
+
+A view the translator can't handle can be given a hand-written handler in the
+project's `djrs.toml` (see `examples/notes/djrs.toml`); it takes precedence:
 
 ```toml
 [shims]

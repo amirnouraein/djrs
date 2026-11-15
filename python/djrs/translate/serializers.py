@@ -199,6 +199,12 @@ class Serializers:
             if mf.kind == "str":
                 return nullable("Py::Str(x.clone())")
             return nullable(_int_py(mf))
+        if cls == "rest_framework.fields.ModelField":
+            # to_representation returns the value for None/int/float/..., else
+            # value_to_string(obj), which JSON fields define as the value itself.
+            if mf.kind == "json":
+                return nullable("x.0.clone()")
+            raise Unsupported("%s: ModelField over a %s column" % (where, mf.kind))
         if cls == "rest_framework.fields.ReadOnlyField":
             conv = {
                 "str": "Py::Str(x.clone())",

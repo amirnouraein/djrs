@@ -22,6 +22,12 @@ INT_TYPES = {
     "PositiveIntegerField", "PositiveSmallIntegerField", "PositiveBigIntegerField",
 }  # fmt: skip
 AUTO_TYPES = {"AutoField", "BigAutoField", "SmallAutoField"}
+# Field classes from outside Django whose Python value works exactly like a
+# Django field's, on the given database vendors.
+KNOWN_FIELDS = {
+    # json.loads on read, json.dumps on write, value_to_string returns the value.
+    "django_mysql.models.fields.json.JSONField": ("json", {"mysql"}),
+}
 STR_TYPES = {"CharField", "TextField", "SlugField", "EmailField", "URLField", "GenericIPAddressField"}
 # FileField/ImageField hold FieldFile objects in Python, not str.
 
@@ -43,7 +49,9 @@ class Field:
         self.default = raw.get("default") or {"$none": True}
         self.auto_now = bool(raw.get("auto_now"))
         self.auto_now_add = bool(raw.get("auto_now_add"))
-        self.custom = not (raw.get("class") or "").startswith("django.")
+        cls = raw.get("class") or ""
+        known = KNOWN_FIELDS.get(cls)
+        self.custom = not cls.startswith("django.") and not (known and schema.vendor in known[1])
         self.ident = entities.field_ident(self.attname)
         self.kind, self.why = self._kind(model, schema)
         self.rust_base = None
@@ -179,6 +187,13 @@ class Schema:
                 if r.get("sender") in (None, label):
                     return True
         return False
+
+    def check_readable(self, m):
+        """Loading rows runs __init__ and init signals; only plain models are read."""
+        if m.raw.get("custom_init"):
+            raise Unsupported("reading %s: the model overrides __init__" % m.label)
+        if self.has_receivers(m.label, ("pre_init", "post_init")):
+            raise Unsupported("reading %s: the model has init signal receivers" % m.label)
 
     def check_writable(self, m, what):
         """create()/save() reproduce Django's in-memory instance only for plain models."""

@@ -278,6 +278,47 @@ pub fn setitem(v: &mut Py, key: &Py, value: Py) -> Result<(), Stop> {
     }
 }
 
+/// `str.isspace()` for one character: Unicode White_Space plus the
+/// separators U+001C..U+001F, which Python also counts.
+pub fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `s.strip()` (no arguments).
+pub fn strip(v: &Py) -> Result<Py, Stop> {
+    match v {
+        Py::Str(s) => Ok(Py::Str(s.trim_matches(py_space).to_string())),
+        _ => fwd(".strip() on a value that isn't a str"),
+    }
+}
+
+/// `s.lower()` / `s.upper()`: exact for ASCII; other text goes to Django
+/// (Python's full case mapping isn't reproduced).
+pub fn case(v: &Py, upper: bool) -> Result<Py, Stop> {
+    match v {
+        Py::Str(s) if s.is_ascii() => Ok(Py::Str(if upper {
+            s.to_ascii_uppercase()
+        } else {
+            s.to_ascii_lowercase()
+        })),
+        Py::Str(_) => fwd("case mapping of non-ASCII text"),
+        _ => fwd(".lower()/.upper() on a value that isn't a str"),
+    }
+}
+
+/// `{**other}` inside a dict display.
+pub fn dict_update(d: &mut Py, other: &Py) -> Result<(), Stop> {
+    match (d, other) {
+        (Py::Dict(d), Py::Dict(o)) => {
+            for (k, v) in o {
+                d.insert(k.clone(), v.clone());
+            }
+            Ok(())
+        }
+        _ => fwd("** of a value that isn't a dict"),
+    }
+}
+
 /// `x.append(value)`.
 pub fn append(v: &mut Py, value: Py) -> Result<(), Stop> {
     match v {
@@ -426,6 +467,20 @@ mod tests {
         assert_eq!(add(&Py::Int(1), &Py::Float(0.5)).unwrap(), Py::Float(1.5));
         assert!(add(&Py::Int(i64::MAX), &Py::Int(1)).is_err());
         assert!(add(&Py::Str("a".into()), &Py::Int(1)).is_err());
+    }
+
+    #[test]
+    fn string_methods() {
+        assert_eq!(
+            strip(&Py::Str("\u{1f} a \u{3000}".into())).unwrap(),
+            Py::Str("a".into())
+        );
+        assert_eq!(
+            case(&Py::Str("AbC".into()), false).unwrap(),
+            Py::Str("abc".into())
+        );
+        assert!(case(&Py::Str("İ".into()), false).is_err());
+        assert!(strip(&Py::Int(1)).is_err());
     }
 
     #[test]

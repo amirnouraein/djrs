@@ -58,6 +58,40 @@ setting (value only if harmless), celery_task, object, unresolved.
 statics + registration), shim modules via `#[path]`, `djrs-coverage.json`,
 `COVERAGE.md`.
 
+## Translator (python/djrs/translate)
+
+`translate(ir)` turns each DRF function view into a Rust handler, or gives
+the reason it can't. It runs every view twice: the first pass learns each
+variable's type, the second emits code with those types fixed.
+
+* **Static types.** Plain Python values are `Py` (operations in
+  `djrs_runtime::ops`). A queryset is a SeaORM `Condition` plus an
+  `orm::Ordering` and a static slice. A model instance is `Option<Model>`
+  holding exactly Django's in-memory values: writes take only values of the
+  column's own Python type, so in-memory and stored values never differ.
+  `request`, `request.user`, `request.data` are compile-time aliases.
+* **Exceptions.** Whatever Python would raise becomes `Stop::Forward`, so
+  Django runs the view again from the start, after the transaction has been
+  rolled back. `except Model.DoesNotExist` is the one handler run in Rust:
+  its body is inlined where `.get()` finds nothing. Every other except
+  clause is left to Django (any error in the try body forwards), which is
+  exact as long as the body has no `raise`.
+* **Aliasing.** Python lists and dicts are shared by reference and the Rust
+  copies. A list or dict changed in place must start as a fresh display and
+  may be stored elsewhere only in the `return` expression.
+* **Definite assignment.** Reading a variable that may be unbound (or used
+  after `delete()`) is refused.
+* **Models.** Rows are read only for models without custom `__init__` or
+  init signals; written only for complete entities without custom `save`,
+  save signals or multi-table inheritance. Deletes reproduce the Collector:
+  CASCADE recursively (children first), SET_NULL, PROTECT, DO_NOTHING.
+* **Third-party fields** are known by class and vendor in
+  `schema.KNOWN_FIELDS` (django_mysql's JSONField on MySQL). Other custom
+  fields make any use of the field forward.
+
+Output: `src/translated.rs` (serializer and delete helpers used, then one
+handler per view, each preceded by its Python). `djrs.toml` handlers win.
+
 ## Runtime (crates/djrs-runtime)
 
 | Module | Job |
@@ -71,7 +105,8 @@ statics + registration), shim modules via `#[path]`, `djrs-coverage.json`,
 | `signing` | salted_hmac, django.core.signing loads, legacy session decode, PBKDF2 |
 | `auth` | DRF Token/Session/Basic + Django session/auth middleware semantics |
 | `drf` | APIView cycle: negotiation, auth, permissions, 405, errors, request.data, finalize, middleware headers |
-| `orm` | Django lookups per backend (icontains), Python coercions (`int()`, `str()`) |
+| `orm` | Django lookups per backend (as `DatabaseWrapper.operators` writes them), `exclude()`'s NULL rule, ordering, value coercions for lookups (`get_prep_value`) and writes |
+| `ops` | Python operators and builtins on `Py`: `==` / `<` across int, float, bool; `in`; indexing; `str()`; `int()`; `len()`; `strip()`; dict displays |
 | `settings` | `ProjectSettings` filled by the generator; secrets from env |
 
 Transaction rule: a DRF handler runs in one transaction; render, then commit;
@@ -127,11 +162,9 @@ Transaction rule: a DRF handler runs in one transaction; render, then commit;
 ## Roadmap
 
 1. ~~Extractor~~ 2. ~~Forwarding binary~~ 3. ~~Test hook~~ 4. ~~Runtime basics~~
-5. **Translator** (next): Python AST of DRF function views -> handlers in the
-   shape of `examples/notes/rust/notes_shims.rs` (the golden target). Rule-based;
-   any construct outside the supported subset leaves the view forwarded with a
-   reason. Start with the notes views, then widen using simplywise's
-   `api/v2/public` coverage report as a real-world target.
+5. ~~Translator~~, first version. Widen next by what the production
+   project's `COVERAGE.md` says most: calls to project helper functions,
+   UUID keys, `request.FILES`, `using()`.
 6. Side-by-side replay (writes: rows changed, Celery jobs queued).
 7. Wider coverage: class-based views, serializers in general, transactions and
    locks, Celery publishing, middleware mapping in `djrs.toml`, CSRF.

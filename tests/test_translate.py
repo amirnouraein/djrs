@@ -88,8 +88,11 @@ REFS = {
         "project": True,
     },
     "len": {"kind": "builtin", "name": "len"},
+    "list": {"kind": "builtin", "name": "list"},
+    "NotFound": {"kind": "class", "path": "rest_framework.exceptions.NotFound", "mro": []},
     "Exception": {"kind": "builtin", "name": "Exception"},
     "str": {"kind": "builtin", "name": "str"},
+    "int": {"kind": "builtin", "name": "int"},
     "helper": {"kind": "function", "path": "demo.views.helper", "project": True},
     "send_mail_task": {"kind": "celery_task", "path": "demo.tasks.send_mail_task"},
 }
@@ -192,6 +195,38 @@ class AcceptsTests(unittest.TestCase):
         )
         self.assertIsNone(why)
 
+    def test_broad_except_is_left_to_django(self):
+        # Any exception in the body forwards; Django then runs the except clause.
+        src, why = run(
+            """
+            @api_view(["GET"])
+            def v(request):
+                try:
+                    item = Item.objects.get(pk=int(request.query_params.get("id")))
+                    name = item.name
+                except Exception as e:
+                    return Response({"error": str(e)}, status=500)
+                return Response({"name": name})
+            """
+        )
+        self.assertIsNone(why)
+        self.assertNotIn("status(500)", src)
+
+    def test_comprehension_and_related_object(self):
+        src, why = run(
+            """
+            @api_view(["GET"])
+            def v(request):
+                items = Item.objects.filter(owner=request.user)
+                return Response({
+                    "names": [i.name for i in items if i.count > 0],
+                    "by_id": {str(i.id): i.owner.username for i in items},
+                })
+            """
+        )
+        self.assertIsNone(why)
+        self.assertIn("e::auth_user::Entity::find()", src)
+
     def test_exclude_keeps_nulls(self):
         src, why = run(
             """
@@ -257,18 +292,20 @@ class RefusesTests(unittest.TestCase):
             "may be unbound",
         )
 
-    def test_broad_except(self):
+    def test_raise_inside_a_broad_try(self):
+        # The except clause would catch the DRF exception: Rust can't skip it.
         self.check(
             """
             @api_view(["GET"])
             def v(request):
                 try:
-                    item = Item.objects.get(pk=1)
+                    if not request.query_params.get("a"):
+                        raise NotFound()
                 except Exception:
                     return Response({}, status=500)
                 return Response({})
             """,
-            "except clauses other than Model.DoesNotExist",
+            "raise inside a try",
         )
 
     def test_project_function_and_celery(self):
@@ -303,12 +340,12 @@ class RefusesTests(unittest.TestCase):
             """
             @api_view(["GET"])
             def v(request):
-                return Response([i for i in [1, 2]])
+                return Response(list({i for i in [1, 2]}))
             """,
-            "comprehensions",
+            "set comprehensions",
         )
 
-    def test_related_object_access(self):
+    def test_rows_are_not_plain_values(self):
         self.check(
             """
             @api_view(["GET"])
@@ -316,7 +353,7 @@ class RefusesTests(unittest.TestCase):
                 item = Item.objects.first()
                 return Response({"owner": item.owner})
             """,
-            "related object",
+            "used as a plain Python value",
         )
 
     def test_writes_on_models_with_signals(self):

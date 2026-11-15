@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import struct
 import textwrap
+import warnings
 
 from djrs.generate.rust import raw_str
 
@@ -268,8 +269,8 @@ def var_rust_type(t, tr):
         return "Option<DrfResponse>", "None"
     if t == DATETIME:
         return "DateTime<Utc>", "DateTime::<Utc>::MIN_UTC"
-    if t == OPAQUE:
-        return None, None
+    if t in (OPAQUE, USER, DATA, QUERY):
+        return None, None  # no Rust variable: an alias, or never read
     raise Unsupported("a variable holding a %s" % (getattr(t, "name", None) or type(t).__name__))
 
 
@@ -304,24 +305,38 @@ def diverges(stmts):
 
 
 def collect_locals(fn):
+    """The function's local names. Comprehension variables belong to the
+    comprehension (Python 3 scoping), not to the function."""
     names = set(a.arg for a in fn.args.args)
-    for node in ast.walk(fn):
-        if node is fn:
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            raise Unsupported("nested function or class")
-        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            raise Unsupported("comprehensions")
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            raise Unsupported("global/nonlocal")
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            raise Unsupported("import inside the view")
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            names.add(node.id)
-        if isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        if getattr(ast, "NamedExpr", None) and isinstance(node, ast.NamedExpr):
-            raise Unsupported("assignment expressions")
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                raise Unsupported("nested function or class")
+            if isinstance(child, (ast.SetComp, ast.GeneratorExp)):
+                raise Unsupported("set comprehensions and generator expressions")
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                raise Unsupported("global/nonlocal")
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                raise Unsupported("import inside the view")
+            if getattr(ast, "NamedExpr", None) and isinstance(child, ast.NamedExpr):
+                raise Unsupported("assignment expressions")
+            if isinstance(child, (ast.ListComp, ast.DictComp)):
+                for g in child.generators:
+                    visit(g.iter)
+                    for c in g.ifs:
+                        visit(c)
+                for part in ("elt", "key", "value"):
+                    if getattr(child, part, None) is not None:
+                        visit(getattr(child, part))
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                names.add(child.id)
+            if isinstance(child, ast.ExceptHandler) and child.name:
+                names.add(child.name)
+            visit(child)
+
+    visit(fn)
     return names
 
 
@@ -359,7 +374,9 @@ def parse_function(view):
     if not src:
         raise Unsupported("view source not found")
     try:
-        tree = ast.parse(textwrap.dedent(src))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # e.g. invalid escapes in the project's strings
+            tree = ast.parse(textwrap.dedent(src))
     except SyntaxError:
         raise Unsupported("view source doesn't parse with this Python")
     fns = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -643,32 +660,58 @@ class FnLower:
         return True
 
     def s_Try(self, s):
+        """Only `Model.DoesNotExist` from `.get()` is caught in Rust (its
+        handler is inlined where it would be raised). Any other exception in
+        the try body already hands the request to Django, which then runs the
+        except clause itself: so other except clauses need no translation,
+        as long as nothing in the body raises natively (a `raise` statement)."""
         if s.finalbody:
             raise Unsupported("try ... finally")
-        labels = set()
+        frame = None
+        broad = False
         for h in s.handlers:
-            if h.type is None:
-                raise Unsupported("bare except")
-            types = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
-            for t in types:
-                v = self.expr(t)
-                if not isinstance(v.t, DoesNotExistT):
-                    raise Unsupported("except clauses other than Model.DoesNotExist")
-                labels.add(v.t.label)
-            if h.name and any(isinstance(n, ast.Name) and n.id == h.name for b in h.body for n in ast.walk(b)):
-                raise Unsupported("using the caught exception")
-            if not diverges(h.body):
-                raise Unsupported("except clause that doesn't return or raise")
-        if len(s.handlers) != 1:
-            raise Unsupported("several except clauses")
-        self.catch.append((None if None in labels else labels, s.handlers[0].body))
+            labels, other = self._except_kinds(h)
+            if labels:
+                if frame is not None:
+                    raise Unsupported("several except clauses for DoesNotExist")
+                if h.name and any(isinstance(n, ast.Name) and n.id == h.name for b in h.body for n in ast.walk(b)):
+                    raise Unsupported("using the caught exception")
+                if not diverges(h.body):
+                    raise Unsupported("except clause that doesn't return or raise")
+                frame = (None if None in labels else labels, h.body)
+            if other:
+                broad = True
+                break  # later clauses only see what this one doesn't catch: never DoesNotExist here
+        if broad and any(isinstance(n, ast.Raise) for b in s.body for n in ast.walk(b)):
+            raise Unsupported("raise inside a try whose except clause catches it")
+        if frame is not None:
+            self.catch.append(frame)
         try:
             div = self.block(s.body)
         finally:
-            self.catch.pop()
+            if frame is not None:
+                self.catch.pop()
         if s.orelse and not div:
             div = self.block(s.orelse)
         return div
+
+    def _except_kinds(self, h):
+        """(DoesNotExist labels caught, whether anything else is caught)."""
+        if h.type is None:
+            return set(), True
+        labels, other = set(), False
+        for t in h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]:
+            saved = self.capture()
+            try:
+                v = self.expr(t)
+            except Unsupported:
+                v = None
+            self.block_expr(saved, "")
+            if v is not None and isinstance(v.t, DoesNotExistT):
+                labels.add(v.t.label)
+            else:
+                other = True
+        return labels, other
 
     # ---- assignment ------------------------------------------------------------
 
@@ -687,10 +730,12 @@ class FnLower:
         if isinstance(target, ast.Attribute):
             return self.set_attr(target, v)
         if isinstance(target, ast.Subscript):
+            if not isinstance(target.value, ast.Name):
+                raise Unsupported("item assignment into an attribute or nested item")
+            if target.value.id in self.iterating:
+                raise Unsupported("item assignment to the sequence being iterated")
             base = self.expr(target.value)
             self.need_py(base, "item assignment target")
-            if not base.place or (isinstance(target.value, ast.Name) and target.value.id in self.iterating):
-                raise Unsupported("item assignment to a temporary or to the sequence being iterated")
             key = self.need_py(self.expr(_slice(target)))
             self.out.line("ops::setitem(&mut %s, %s, %s)?;" % (base.r, ref(key), self.own(self.need_py(v))))
             return
@@ -701,7 +746,7 @@ class FnLower:
             raise Unsupported("rebinding the name being iterated")
         t = self._set_type(name, v.t)
         var = self.var(name)
-        if v.t == OPAQUE:
+        if v.t in (OPAQUE, USER, DATA, QUERY):
             pass
         elif isinstance(t, PyT):
             self.out.line("%s = %s;" % (var, self.own(self.need_py(v))))
@@ -766,6 +811,8 @@ class FnLower:
                 return V(t, '%s.clone().expect("assigned")' % var)
             if t == DATETIME:
                 return V(t, var)
+            if t in (USER, DATA, QUERY):
+                return V(t)
             raise Unsupported("variable %s holds a %s" % (name, _tname(t)))
         return self.ref_value(name)
 
@@ -865,6 +912,9 @@ class FnLower:
                 return self.let("Py::Bool(%sctx.user.is_some())" % neg, PyT("bool"))
             if name in ("is_staff", "is_superuser", "is_active"):
                 return self.let("Py::Bool(ctx.user.as_ref().map_or(false, |u| u.%s))" % name, PyT("bool"))
+            label = self.tr.schema.user_model
+            if label and name in self.model(label).by_name:
+                return self.read_field(self.user_row(), name)
             raise Unsupported("request.user.%s" % name)
         if t == DATA:
             raise Unsupported("request.data.%s" % name)
@@ -884,7 +934,7 @@ class FnLower:
         m = self.model(row.t.label)
         f = m.field(name)
         if f.is_fk and name == f.name and f.name != f.attname:
-            raise Unsupported("reading a related object (another query)")
+            return self.related(row, f)
         f.need()
         acc = "r.%s" % f.ident
         conv = {
@@ -909,6 +959,38 @@ class FnLower:
         else:
             inner = "{ let x = %s%s; %s }" % ("" if copy else "&", acc, conv)
         return self.let("match &%s { Some(r) => %s, None => %s }" % (row.r, inner, self.fwd("attribute of None")))
+
+    def related(self, row, f):
+        """`instance.<fk>`: the related row, loaded with the query Django runs."""
+        f.need()
+        target = self.model(f.related_model).need_entity()
+        self.tr.schema.check_readable(target)
+        if f.target_column != target.pk.column:
+            raise Unsupported("relation using to_field")
+        find = "%s::Entity::find().filter(orm::exact(%s, Some(id.clone()))).one(ctx.tx()).await?" % (
+            target.entity, raw_str(target.pk.column))
+        missing = self.fwd("related object does not exist")
+        load = "match %s { Some(x) => Some(x), None => %s }" % (find, missing)
+        if f.null:
+            inner = "match &r.%s { Some(id) => %s, None => None }" % (f.ident, load)
+        else:
+            inner = "{ let id = &r.%s; %s }" % (f.ident, load)
+        return self.let(
+            "match &%s { Some(r) => %s, None => %s }" % (row.r, inner, self.fwd("attribute of None")),
+            RowT(target.label),
+        )
+
+    def user_row(self):
+        """request.user as a row of the user model (anonymous: forward)."""
+        label = self.tr.schema.user_model
+        m = self.model(label).need_entity()
+        self.tr.schema.check_readable(m)
+        pk = self.let("match ctx.user_pk_value() { Some(v) => v, None => %s }" % self.fwd("attribute of AnonymousUser"), OPAQUE)
+        return self.let(
+            "match %s::Entity::find().filter(orm::exact(%s, Some(%s.clone()))).one(ctx.tx()).await? { Some(x) => Some(x), None => %s }"
+            % (m.entity, raw_str(m.pk.column), pk.r, self.fwd("user row vanished")),
+            RowT(label),
+        )
 
     def set_attr(self, target, v):
         if not isinstance(target.value, ast.Name):
@@ -1174,6 +1256,18 @@ class FnLower:
         return self.let("if %s { %s } else { %s }" % (c, a_expr, b_expr))
 
     def e_Dict(self, n):
+        if any(k is None for k in n.keys):
+            d = self.tmp("d")
+            self.out.line("let mut %s = Py::dict();" % d)
+            for k, v in zip(n.keys, n.values):
+                if k is None:
+                    other = self.py(v)
+                    self.out.line("ops::dict_update(&mut %s, %s)?;" % (d, ref(other)))
+                else:
+                    kv = self.py(k)
+                    vv = self.py(v)
+                    self.out.line("ops::setitem(&mut %s, %s, %s)?;" % (d, ref(kv), self.own(vv)))
+            return V(PyT("dict"), d, place=True)
         items = []
         for k, v in zip(n.keys, n.values):
             if k is None:
@@ -1182,6 +1276,61 @@ class FnLower:
             vv = self.py(v)
             items.append("(%s, %s)" % (self.own(kv), self.own(vv)))
         return self.let("ops::dict(vec![%s])?" % ", ".join(items), PyT("dict"))
+
+    def e_ListComp(self, n):
+        return self.comprehension(n, "list")
+
+    def e_DictComp(self, n):
+        return self.comprehension(n, "dict")
+
+    def comprehension(self, n, kind):
+        if len(n.generators) != 1:
+            raise Unsupported("comprehensions with several for clauses")
+        g = n.generators[0]
+        if getattr(g, "is_async", 0) or not isinstance(g.target, ast.Name):
+            raise Unsupported("comprehension with unpacking or async")
+        it = self.expr(g.iter)
+        name = g.target.id
+        if isinstance(it.t, (QsT, ManagerT)):
+            qs = self.as_qs(it)
+            head, vt, bind = "for it in %s" % self.qs_rows(qs), RowT(qs.t.label), "Some(it)"
+        elif isinstance(it.t, RowsT):
+            head, vt, bind = "for it in %s" % it.r, RowT(it.t.label), "Some(it)"
+        elif isinstance(it.t, PyT):
+            head, vt, bind = "for it in ops::iter(%s)?" % ref(it), PyT(), "it"
+        else:
+            raise Unsupported("comprehension over a %s" % _tname(it.t))
+        out = self.tmp("out")
+        self.out.line("let mut %s = Vec::new();" % out)
+        saved = (self.var_types.get(name, NOCONST), set(self.assigned), set(self.deleted), set(self.locals))
+        self.var_types[name] = vt
+        self.assigned.add(name)
+        self.deleted.discard(name)
+        self.locals.add(name)
+        try:
+            self.out.open(head)
+            self.out.line("let mut %s: %s = %s;" % (self.var(name), var_rust_type(vt, self.tr)[0], bind))
+            opened = 1
+            for c in g.ifs:
+                self.out.open("if %s" % self.cond(c))
+                opened += 1
+            if kind == "list":
+                self.out.line("%s.push(%s);" % (out, self.own(self.py(n.elt))))
+            else:
+                k = self.py(n.key)
+                v = self.py(n.value)
+                self.out.line("%s.push((%s, %s));" % (out, self.own(k), self.own(v)))
+            for _ in range(opened):
+                self.out.close()
+        finally:
+            old, self.assigned, self.deleted, self.locals = saved
+            if old is NOCONST:
+                self.var_types.pop(name, None)
+            else:
+                self.var_types[name] = old
+        if kind == "list":
+            return self.let("Py::List(%s)" % out, PyT("list"))
+        return self.let("ops::dict(%s)?" % out, PyT("dict"))
 
     def e_List(self, n):
         items = [self.own(self.py(e)) for e in n.elts]
@@ -1290,6 +1439,8 @@ class FnLower:
 
     def builtin(self, name, n):
         pos, kw = self.args(n)
+        if name == "isinstance" and len(pos) == 2 and not kw:
+            return self.isinstance(pos[0], n.args[1])
         if kw or len(pos) != 1:
             raise Unsupported("%s() with these arguments" % name)
         (x,) = pos
@@ -1313,6 +1464,23 @@ class FnLower:
                 return x
             return self.let("Py::List(ops::iter(%s)?)" % ref(self.need_py(x)), PyT("list"))
         raise Unsupported("builtin %s()" % name)
+
+    def isinstance(self, x, types_node):
+        pats = {
+            "str": "Py::Str(_)", "int": "Py::Int(_) | Py::Bool(_)", "bool": "Py::Bool(_)",
+            "float": "Py::Float(_)", "dict": "Py::Dict(_)", "list": "Py::List(_)",
+        }  # fmt: skip
+        self.need_py(x)
+        if x.t.kind == "tuple":
+            raise Unsupported("isinstance() of a tuple")
+        nodes = types_node.elts if isinstance(types_node, ast.Tuple) else [types_node]
+        alts = []
+        for t in nodes:
+            v = self.expr(t)
+            if not (isinstance(v.t, Named) and v.t.what == "builtin" and v.t.name in pats):
+                raise Unsupported("isinstance() with a type other than str/int/float/bool/dict/list")
+            alts.append(pats[v.t.name])
+        return self.let("Py::Bool(matches!(%s, %s))" % (x.r, " | ".join(alts)), PyT("bool"))
 
     def response(self, pos, kw):
         names = ["data", "status"]
@@ -1426,6 +1594,12 @@ class FnLower:
                 raise Unsupported("appending to the list being iterated")
             self.out.line("ops::append(&mut %s, %s)?;" % (self.var(target), self.own(self.need_py(pos[0]))))
             return V(PyT("none"), "Py::None", const=None)
+        if isinstance(t, PyT) and name in ("strip", "lower", "upper"):
+            if n.args or n.keywords:
+                raise Unsupported(".%s() with arguments" % name)
+            if name == "strip":
+                return self.let("ops::strip(%s)?" % ref(base), PyT("str"))
+            return self.let("ops::case(%s, %s)?" % (ref(base), "true" if name == "upper" else "false"), PyT("str"))
         if isinstance(t, PyT):
             if name == "get":
                 pos, kw = self.args(n)
@@ -1441,6 +1615,7 @@ class FnLower:
     def as_qs(self, v):
         if isinstance(v.t, ManagerT):
             self.model(v.t.label).need_entity()
+            self.tr.schema.check_readable(self.model(v.t.label))
             return V(QsT(v.t.label), "Condition::all()", extra="None")
         return v
 
